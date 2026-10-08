@@ -41,6 +41,15 @@ def extract_roi_pixels(frame, roi):
     return frame[y1:y2, x1:x2]
 
 
+def mean_rgb(pixels):
+    """Return the average (R, G, B) of the ROI pixels.
+
+    OpenCV stores pixels in B, G, R order, so the result is reordered to R, G, B.
+    """
+    b, g, r = pixels.reshape(-1, 3).mean(axis=0)
+    return float(r), float(g), float(b)
+
+
 def draw_roi(frame, roi, label="Forehead", color=(0, 255, 0)):
     """Draw the ROI box with a label on the frame."""
     x1, y1, x2, y2 = roi
