@@ -1,7 +1,7 @@
 """Signal collection and processing.
 
 Phase 2: a rolling buffer that keeps the last few seconds of mean RGB values.
-Phase 4: resampling, band-pass filter, FFT and heart rate.
+Phase 4: resampling, band-pass filter, FFT, heart rate, signal quality and smoothing.
 """
 
 from collections import deque
@@ -22,6 +22,12 @@ HIGH_HZ = MAX_BPM / 60   # 3.0 Hz
 # Butterworth filter already weakens frequencies close to its cut-off points
 FILTER_LOW_HZ = 0.6
 FILTER_HIGH_HZ = 3.3
+
+# Signal quality. These values were chosen by testing with synthetic signals:
+# pure noise stayed below 0.45, while clear pulses scored about 0.7-0.9.
+PEAK_WIDTH_HZ = 0.1      # power within +/-0.1 Hz (+/-6 BPM) of the peak counts as "heart rate"
+GOOD_QUALITY = 0.60      # peak power ratio needed for "Good"
+FAIR_QUALITY = 0.45      # peak power ratio needed for "Fair"; below this is "Poor"
 
 
 class RGBBuffer:
@@ -97,16 +103,51 @@ def power_spectrum(signal, fs=SAMPLE_RATE):
 def find_heart_rate(freqs, power):
     """Find the dominant frequency between 40 and 180 BPM.
 
-    Returns the dominant frequency x 60 (BPM), or None if the result is not valid.
+    Returns (bpm, peak_ratio):
+      bpm        -- dominant frequency x 60, or None if the result is not valid
+      peak_ratio -- share of the 40-180 BPM power that lies close to the peak (0 to 1).
+                    A clean pulse puts most of its power in one peak, noise spreads it out.
     """
     band = (freqs >= LOW_HZ) & (freqs <= HIGH_HZ)
     band_freqs, band_power = freqs[band], power[band]
-    if band_power.sum() <= 0:
-        return None
+    total = band_power.sum()
+    if total <= 0:
+        return None, 0.0
 
     peak = int(np.argmax(band_power))
+    peak_hz = band_freqs[peak]
+    near_peak = np.abs(band_freqs - peak_hz) <= PEAK_WIDTH_HZ
+    peak_ratio = float(band_power[near_peak].sum() / total)
 
     # A peak on the edge of the range is leakage from outside it, not a heart rate
     if peak == 0 or peak == len(band_power) - 1:
-        return None
-    return band_freqs[peak] * 60
+        return None, peak_ratio
+    return peak_hz * 60, peak_ratio
+
+
+def signal_quality(peak_ratio):
+    """Convert the peak power ratio into Good / Fair / Poor."""
+    if peak_ratio >= GOOD_QUALITY:
+        return "Good"
+    if peak_ratio >= FAIR_QUALITY:
+        return "Fair"
+    return "Poor"
+
+
+class BPMSmoother:
+    """Moving average of the most recent BPM estimates, so the displayed value is stable."""
+
+    def __init__(self, size=5):
+        self.values = deque(maxlen=size)
+
+    def add(self, bpm):
+        self.values.append(bpm)
+
+    def value(self):
+        """Smoothed BPM, or None if there are no estimates yet."""
+        if not self.values:
+            return None
+        return sum(self.values) / len(self.values)
+
+    def clear(self):
+        self.values.clear()
