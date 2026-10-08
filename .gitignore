@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# MediaPipe model (downloaded automatically on first run)
+models/
+
+# Local database
+data/*.db
+
+# Editor / tool settings
+.claude/
+.vscode/
+.idea/
