@@ -2,6 +2,7 @@
 
 import sys
 import threading
+import time
 
 import cv2
 
@@ -14,7 +15,7 @@ _camera_lock = threading.Lock()
 class Camera:
     """Opens the webcam and returns frames one at a time."""
 
-    def __init__(self, index=0, width=640, height=480, wait_seconds=3):
+    def __init__(self, index=0, width=640, height=480, wait_seconds=3, warmup_seconds=2):
         self.cap = None
         # Wait briefly so a previous run (e.g. after a page refresh) can release the webcam
         if not _camera_lock.acquire(timeout=wait_seconds):
@@ -25,10 +26,21 @@ class Camera:
             self.cap = cv2.VideoCapture(index, backend)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self._warm_up(warmup_seconds)
         except Exception:
             self.cap = None
             _camera_lock.release()
             raise
+
+    def _warm_up(self, seconds):
+        """Throw away the first frames while the webcam's auto exposure settles.
+
+        These frames start very dark and get brighter, which would look like
+        a huge colour change in the signal.
+        """
+        end = time.time() + seconds
+        while self.cap.isOpened() and time.time() < end:
+            self.cap.read()
 
     def is_opened(self):
         return self.cap is not None and self.cap.isOpened()
