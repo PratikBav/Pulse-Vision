@@ -35,16 +35,21 @@ if not running:
 
 camera = Camera()
 if not camera.is_opened():
-    video_placeholder.error("Could not open the webcam. Check that it is connected and not used by another app.")
+    camera.release()
+    video_placeholder.error(
+        "Could not open the webcam. Check that it is connected and not already "
+        "in use by another app or another PulseVision browser tab."
+    )
     st.stop()
 
-detector = FaceMeshDetector()
+detector = None
 start_time = time.time()
 frame_count = 0
 
 # Streamlit stops this loop automatically when the toggle is switched off,
 # and the 'finally' block releases the webcam.
 try:
+    detector = FaceMeshDetector()
     while True:
         frame = camera.read()
         if frame is None:
@@ -77,4 +82,5 @@ try:
         video_placeholder.image(frame, channels="BGR", width="stretch")
 finally:
     camera.release()
-    detector.close()
+    if detector is not None:
+        detector.close()
