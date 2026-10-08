@@ -18,6 +18,30 @@ from signal_processing import RGBBuffer
 CHART_INTERVAL_SECONDS = 1.0  # redrawing charts every frame would slow the video down
 RGB_COLORS = ["#e53935", "#43a047", "#1e88e5"]
 
+
+def draw_line_chart(placeholder, df, columns, colors, y_title):
+    """Draw a line chart of df[columns] against df["Time (s)"].
+
+    Uses st.vega_lite_chart because st.line_chart takes ~60 ms per call,
+    which pauses frame capture and leaves gaps in the pulse signal.
+    """
+    spec = {
+        "height": 250,
+        "mark": {"type": "line", "strokeWidth": 1.5},
+        "transform": [{"fold": columns, "as": ["Signal", "Value"]}],
+        "encoding": {
+            "x": {"field": "Time (s)", "type": "quantitative"},
+            "y": {"field": "Value", "type": "quantitative", "title": y_title, "scale": {"zero": False}},
+            "color": {
+                "field": "Signal",
+                "type": "nominal",
+                "scale": {"domain": columns, "range": colors},
+                "legend": {"orient": "bottom"} if len(columns) > 1 else None,
+            },
+        },
+    }
+    placeholder.vega_lite_chart(df, spec, width="stretch")
+
 st.set_page_config(page_title="PulseVision", layout="wide")
 st.title("PulseVision")
 st.caption("Computer Vision Based Non Contact Heart Rate Detection Using Facial Video")
@@ -118,8 +142,8 @@ try:
             raw["Time (s)"] = times
             norm = pd.DataFrame((values / values.mean(axis=0) - 1) * 100, columns=["R", "G", "B"])
             norm["Time (s)"] = times
-            raw_chart.line_chart(raw, x="Time (s)", y=["R", "G", "B"], color=RGB_COLORS, height=250)
-            norm_chart.line_chart(norm, x="Time (s)", y=["R", "G", "B"], color=RGB_COLORS, height=250)
+            draw_line_chart(raw_chart, raw, ["R", "G", "B"], RGB_COLORS, "Mean value")
+            draw_line_chart(norm_chart, norm, ["R", "G", "B"], RGB_COLORS, "Change (%)")
             fps_status.write(f"Sampling rate: {buffer.sampling_rate():.1f} samples/s")
 
         # Draw overlays last, so they never affect the measured colours
