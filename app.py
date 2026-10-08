@@ -2,6 +2,7 @@
 
 Phase 1: webcam preview, face detection, facial landmarks and forehead ROI.
 Phase 2: mean RGB extraction from the forehead, rolling 12 s buffer, live RGB plots.
+Phase 3: POS rPPG pulse waveform.
 Run with:  streamlit run app.py
 """
 
@@ -13,10 +14,13 @@ import streamlit as st
 from camera import Camera
 from face import FaceMeshDetector, draw_landmarks
 from roi import draw_roi, extract_roi_pixels, get_forehead_roi, mean_rgb
+from rppg import pos
 from signal_processing import RGBBuffer
 
 CHART_INTERVAL_SECONDS = 1.0  # redrawing charts every frame would slow the video down
+MIN_PULSE_SECONDS = 3.0       # need a few seconds of signal before POS gives a useful waveform
 RGB_COLORS = ["#e53935", "#43a047", "#1e88e5"]
+PULSE_COLOR = "#d81b60"
 
 
 def draw_line_chart(placeholder, df, columns, colors, y_title):
@@ -61,14 +65,18 @@ with col_info:
 with col_video:
     video_placeholder = st.empty()
 
-st.subheader("RGB signal (debug)")
-col_raw, col_norm = st.columns(2)
-with col_raw:
-    st.caption("Mean forehead colour (0-255)")
-    raw_chart = st.empty()
-with col_norm:
-    st.caption("Change from each channel's average (%) - the tiny pulse changes are visible here")
-    norm_chart = st.empty()
+st.subheader("Pulse signal (POS)")
+st.caption("Pulse waveform extracted from the forehead colour - each peak should be one heartbeat")
+pulse_chart = st.empty()
+
+with st.expander("RGB signal (debug)"):
+    col_raw, col_norm = st.columns(2)
+    with col_raw:
+        st.caption("Mean forehead colour (0-255)")
+        raw_chart = st.empty()
+    with col_norm:
+        st.caption("Change from each channel's average (%) - the tiny pulse changes are visible here")
+        norm_chart = st.empty()
 
 if not running:
     video_placeholder.info("Turn on 'Start measurement' to open the webcam.")
@@ -134,17 +142,29 @@ try:
             signal_status.success(f"Signal buffer full ({buffer.window_seconds} s, {len(buffer)} samples)")
             signal_progress.empty()
 
-        # Live RGB plots
-        if timestamp - last_chart_time >= CHART_INTERVAL_SECONDS and len(buffer) > 1:
+        # Live charts, refreshed once per second
+        if timestamp - last_chart_time >= CHART_INTERVAL_SECONDS:
             last_chart_time = timestamp
             times, values = buffer.get_arrays()
-            raw = pd.DataFrame(values, columns=["R", "G", "B"])
-            raw["Time (s)"] = times
-            norm = pd.DataFrame((values / values.mean(axis=0) - 1) * 100, columns=["R", "G", "B"])
-            norm["Time (s)"] = times
-            draw_line_chart(raw_chart, raw, ["R", "G", "B"], RGB_COLORS, "Mean value")
-            draw_line_chart(norm_chart, norm, ["R", "G", "B"], RGB_COLORS, "Change (%)")
-            fps_status.write(f"Sampling rate: {buffer.sampling_rate():.1f} samples/s")
+
+            if buffer.duration() < MIN_PULSE_SECONDS:
+                pulse_chart.info("Collecting signal...")
+            else:
+                pulse = pos(values, buffer.sampling_rate())
+                # Scale to a standard deviation of 1 so the chart range stays steady
+                if pulse.std() > 0:
+                    pulse = pulse / pulse.std()
+                pulse_df = pd.DataFrame({"Time (s)": times, "Pulse": pulse})
+                draw_line_chart(pulse_chart, pulse_df, ["Pulse"], [PULSE_COLOR], "Pulse")
+
+            if len(buffer) > 1:
+                raw = pd.DataFrame(values, columns=["R", "G", "B"])
+                raw["Time (s)"] = times
+                norm = pd.DataFrame((values / values.mean(axis=0) - 1) * 100, columns=["R", "G", "B"])
+                norm["Time (s)"] = times
+                draw_line_chart(raw_chart, raw, ["R", "G", "B"], RGB_COLORS, "Mean value")
+                draw_line_chart(norm_chart, norm, ["R", "G", "B"], RGB_COLORS, "Change (%)")
+                fps_status.write(f"Sampling rate: {buffer.sampling_rate():.1f} samples/s")
 
         # Draw overlays last, so they never affect the measured colours
         if landmarks is not None and show_landmarks:

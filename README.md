@@ -25,7 +25,7 @@ Webcam -> Face detection -> Forehead ROI -> Mean RGB per frame -> Rolling buffer
 | 3. Region of interest | A forehead box is placed using the landmarks, so it follows the head | Done |
 | 4. RGB signal | The average red, green and blue value of the forehead is recorded every frame with a timestamp | Done |
 | 5. Rolling buffer | The last 12 seconds of RGB values are kept in memory | Done |
-| 6. Pulse extraction | POS (Plane-Orthogonal-to-Skin) method turns RGB into one pulse signal | Planned |
+| 6. Pulse extraction | POS (Plane-Orthogonal-to-Skin) method turns RGB into one pulse signal, shown as a live waveform | Done |
 | 7. Filtering | Butterworth band-pass filter keeps 40-180 BPM (0.67-3 Hz) | Planned |
 | 8. Heart rate | FFT finds the strongest frequency, BPM = frequency x 60 | Planned |
 | 9. Smoothing and quality | Stable displayed value and a Good / Fair / Poor signal quality indicator | Planned |
@@ -77,8 +77,9 @@ The dashboard opens in the browser at http://localhost:8501.
 1. Turn on **Start measurement** to open the webcam.
 2. A green **Forehead** box appears on your face when it is detected.
 3. Stay still while the signal buffer fills (**Collecting signal... x / 12 s**).
-4. The **RGB signal** charts below the video show how the forehead colour changes over time.
-5. Tick **Show facial landmarks** to see all detected face points.
+4. The **Pulse signal (POS)** chart shows the extracted pulse waveform - each peak is one heartbeat.
+5. Open **RGB signal (debug)** to see how the raw forehead colour changes over time.
+6. Tick **Show facial landmarks** to see all detected face points.
 
 Open the dashboard in **only one browser tab** - the webcam can be used by one tab at a time.
 
@@ -98,6 +99,7 @@ PulseVision/
 ├── camera.py               Webcam access (OpenCV)
 ├── face.py                 Face detection and landmarks (MediaPipe)
 ├── roi.py                  Forehead region of interest and mean RGB
+├── rppg.py                 POS method: RGB signal -> pulse signal
 ├── signal_processing.py    Rolling RGB buffer (filtering and FFT to be added)
 ├── requirements.txt
 └── README.md
@@ -113,7 +115,8 @@ PulseVision/
 
 - [x] Phase 1 - Camera, face detection, landmarks, forehead ROI, live preview
 - [x] Phase 2 - Mean RGB per frame, timestamps, rolling 12 s buffer, live RGB plots
-- [ ] POS pulse extraction, filtering, FFT and BPM estimation
+- [x] Phase 3 - POS rPPG pulse extraction and live pulse waveform
+- [ ] Filtering, FFT and BPM estimation
 - [ ] Smoothing and signal quality indicator
 - [ ] SQLite storage and heart-rate history
 - [ ] Validation against a reference device (pulse oximeter / smartwatch)
