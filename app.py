@@ -1,16 +1,22 @@
 """PulseVision - Streamlit dashboard.
 
 Phase 1: webcam preview, face detection, facial landmarks and forehead ROI.
+Phase 2: mean RGB extraction from the forehead, rolling 12 s buffer, live RGB plots.
 Run with:  streamlit run app.py
 """
 
 import time
 
+import pandas as pd
 import streamlit as st
 
 from camera import Camera
 from face import FaceMeshDetector, draw_landmarks
-from roi import draw_roi, extract_roi_pixels, get_forehead_roi
+from roi import draw_roi, extract_roi_pixels, get_forehead_roi, mean_rgb
+from signal_processing import RGBBuffer
+
+CHART_INTERVAL_SECONDS = 1.0  # redrawing charts every frame would slow the video down
+RGB_COLORS = ["#e53935", "#43a047", "#1e88e5"]
 
 st.set_page_config(page_title="PulseVision", layout="wide")
 st.title("PulseVision")
@@ -22,11 +28,23 @@ with col_info:
     running = st.toggle("Start measurement")
     show_landmarks = st.checkbox("Show facial landmarks")
     face_status = st.empty()
+    signal_status = st.empty()
+    signal_progress = st.empty()
+    rgb_status = st.empty()
     roi_status = st.empty()
     fps_status = st.empty()
 
 with col_video:
     video_placeholder = st.empty()
+
+st.subheader("RGB signal (debug)")
+col_raw, col_norm = st.columns(2)
+with col_raw:
+    st.caption("Mean forehead colour (0-255)")
+    raw_chart = st.empty()
+with col_norm:
+    st.caption("Change from each channel's average (%) - the tiny pulse changes are visible here")
+    norm_chart = st.empty()
 
 if not running:
     video_placeholder.info("Turn on 'Start measurement' to open the webcam.")
@@ -43,42 +61,72 @@ if not camera.is_opened():
     st.stop()
 
 detector = None
-start_time = time.time()
-frame_count = 0
+buffer = RGBBuffer()
 
 # Streamlit stops this loop automatically when the toggle is switched off,
 # and the 'finally' block releases the webcam.
 try:
     detector = FaceMeshDetector()
+    start_time = time.time()
+    last_chart_time = 0.0
     while True:
         frame = camera.read()
         if frame is None:
             video_placeholder.error("Could not read a frame from the webcam.")
             break
 
-        timestamp_ms = (time.time() - start_time) * 1000
-        landmarks = detector.detect(frame, timestamp_ms)
+        timestamp = time.time() - start_time
+        landmarks = detector.detect(frame, timestamp * 1000)
+        roi = get_forehead_roi(landmarks) if landmarks is not None else None
 
         if landmarks is None:
             face_status.metric("Face", "Face not detected")
             roi_status.write("")
+            rgb_status.write("")
+            # The signal must be continuous, so start again when the face is lost
+            buffer.clear()
+        elif roi is None:
+            face_status.metric("Face", "Detected")
+            roi_status.write("Forehead ROI too small - move closer to the camera.")
+            buffer.clear()
         else:
             face_status.metric("Face", "Detected")
-            if show_landmarks:
-                draw_landmarks(frame, landmarks)
+            # Read the colours BEFORE drawing anything on the frame
+            pixels = extract_roi_pixels(frame, roi)
+            rgb = mean_rgb(pixels)
+            buffer.add(timestamp, rgb)
 
-            roi = get_forehead_roi(landmarks)
-            if roi is not None:
-                draw_roi(frame, roi)
-                pixels = extract_roi_pixels(frame, roi)
-                roi_status.write(f"Forehead ROI: {pixels.shape[1]} x {pixels.shape[0]} pixels")
-            else:
-                roi_status.write("Forehead ROI too small - move closer to the camera.")
+            roi_status.write(f"Forehead ROI: {pixels.shape[1]} x {pixels.shape[0]} pixels")
+            rgb_status.write(f"Mean RGB: R={rgb[0]:.1f}  G={rgb[1]:.1f}  B={rgb[2]:.1f}")
 
-        frame_count += 1
-        elapsed = time.time() - start_time
-        fps_status.write(f"Frame rate: {frame_count / elapsed:.1f} FPS")
+        # Signal buffer status
+        if landmarks is None:
+            signal_status.warning("Face not detected")
+            signal_progress.empty()
+        elif buffer.duration() < buffer.window_seconds * 0.95:
+            signal_status.info(f"Collecting signal... {buffer.duration():.1f} / {buffer.window_seconds} s")
+            signal_progress.progress(min(buffer.duration() / buffer.window_seconds, 1.0))
+        else:
+            signal_status.success(f"Signal buffer full ({buffer.window_seconds} s, {len(buffer)} samples)")
+            signal_progress.empty()
 
+        # Live RGB plots
+        if timestamp - last_chart_time >= CHART_INTERVAL_SECONDS and len(buffer) > 1:
+            last_chart_time = timestamp
+            times, values = buffer.get_arrays()
+            raw = pd.DataFrame(values, columns=["R", "G", "B"])
+            raw["Time (s)"] = times
+            norm = pd.DataFrame((values / values.mean(axis=0) - 1) * 100, columns=["R", "G", "B"])
+            norm["Time (s)"] = times
+            raw_chart.line_chart(raw, x="Time (s)", y=["R", "G", "B"], color=RGB_COLORS, height=250)
+            norm_chart.line_chart(norm, x="Time (s)", y=["R", "G", "B"], color=RGB_COLORS, height=250)
+            fps_status.write(f"Sampling rate: {buffer.sampling_rate():.1f} samples/s")
+
+        # Draw overlays last, so they never affect the measured colours
+        if landmarks is not None and show_landmarks:
+            draw_landmarks(frame, landmarks)
+        if roi is not None:
+            draw_roi(frame, roi)
         video_placeholder.image(frame, channels="BGR", width="stretch")
 finally:
     camera.release()

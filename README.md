@@ -29,8 +29,10 @@ The first run downloads the official MediaPipe face model
 | `app.py` | Streamlit dashboard |
 | `camera.py` | Webcam access (OpenCV) |
 | `face.py` | Face detection and 478 facial landmarks (MediaPipe Face Landmarker) |
-| `roi.py` | Forehead region of interest from landmarks |
+| `roi.py` | Forehead region of interest from landmarks, mean RGB of the region |
+| `signal_processing.py` | Rolling 12 s buffer of timestamped mean RGB values |
 
 ## Progress
 
 - [x] Phase 1 — Camera, face detection, landmarks, forehead ROI, live preview
+- [x] Phase 2 — Mean RGB per frame, timestamps, rolling 12 s buffer, live RGB plots
