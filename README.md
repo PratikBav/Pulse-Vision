@@ -9,7 +9,6 @@ heartbeat pushes blood into the skin, which changes the skin colour very slightl
 
 > **Disclaimer:** PulseVision shows an *Estimated Heart Rate*. It is a college
 > project for learning purposes and is **not a medical device**. Do not use it for
-> diagnosis or treatment.
 
 ## How it works
 
