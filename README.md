@@ -50,11 +50,7 @@ Activate it on Windows:
 .venv\Scripts\activate
 ```
 
-or on macOS / Linux:
 
-```bash
-source .venv/bin/activate
-```
 
 Then install the packages:
 
