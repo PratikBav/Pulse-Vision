@@ -59,8 +59,6 @@ source .venv/bin/activate
 Then install the packages:
 
 
-The first run downloads the official MediaPipe face model
-(`models/face_landmarker.task`, about 3.6 MB) automatically.
 
 ## Run
 
