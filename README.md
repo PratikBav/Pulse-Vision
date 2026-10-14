@@ -115,7 +115,6 @@ PulseVision/
 
 - Video frames are processed in memory and are **never saved**.
 - Only numbers (average colour values, and later heart-rate readings) are kept.
-- Everything runs on your own computer; nothing is uploaded.
 
 ## Progress
 
