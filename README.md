@@ -36,37 +36,112 @@ Webcam -> Face detection -> Movement check -> Forehead + cheek ROI -> Mean RGB p
 
 ## Technology
 
-Python 3.10+, OpenCV, MediaPipe, NumPy, SciPy, Streamlit, Pandas and SQLite.
+Python, OpenCV, MediaPipe, NumPy, SciPy, Streamlit, Pandas and SQLite.
 Everything runs locally on a normal laptop - no cloud services.
+
+## Requirements
+
+| What | Details |
+|------|---------|
+| Computer | Windows 10 or 11 laptop/PC (the camera code and the system notifications are made for Windows) |
+| Webcam | Built-in or USB webcam |
+| Python | **3.10 to 3.13** (tested with 3.13.5). Newer Python versions may not have MediaPipe packages yet |
+| Git | To clone the project ([git-scm.com](https://git-scm.com)) |
+| Internet | Only for the setup: installing the packages (a few hundred MB) and the first run, which downloads the MediaPipe face model (about 3.6 MB) |
+| Disk space | About 1.5 GB for the packages |
+
+Python packages (installed in step 4 from `requirements.txt`):
+
+| Package | Used for | Tested version |
+|---------|----------|----------------|
+| `mediapipe` | Face detection and facial landmarks | 1.1.0 |
+| `opencv-contrib-python` | Webcam and image processing (installed with MediaPipe) | 5.0.0.93 |
+| `numpy` | Numbers and arrays | 2.5.3 |
+| `scipy` | Band-pass filter | 1.18.1 |
+| `streamlit` | Dashboard and Notification app | 1.65.0 |
+| `pandas` | Tables, charts and the database log | 3.0.6 |
+
+SQLite is part of Python, so it does not need to be installed.
 
 ## Setup
 
-1. Install Python 3.10 or newer.
-2. Create a virtual environment and install the requirements:
+Do this once, in a terminal (Command Prompt or PowerShell).
+
+1. **Install Python 3.13** from [python.org](https://www.python.org/downloads/).
+   During installation tick **"Add python.exe to PATH"**. Check it worked:
+
+   ```bash
+   python --version
+   ```
+
+2. **Clone the project into a short folder path**, for example `C:\PulseVision`.
+   Some package files are nested very deeply, and Windows refuses paths longer than
+   260 characters, so a long folder path (deep inside Documents, OneDrive, etc.) can make
+   the installation fail.
+
+   ```bash
+   git clone https://github.com/PratikBav/Pulse-Vision.git C:\PulseVision
+   ```
+
+   ```bash
+   cd C:\PulseVision
+   ```
+
+3. **Create and activate a virtual environment** (keeps the packages separate from the rest
+   of the computer):
+
+   ```bash
+   python -m venv .venv
+   ```
+
+   ```bash
+   .venv\Scripts\activate
+   ```
+
+   The prompt now starts with `(.venv)`. If PowerShell says *running scripts is disabled*,
+   run this once and then activate again:
+
+   ```bash
+   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+   ```
+
+4. **Install the packages** (takes a few minutes):
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Run
+
+Every time, open a terminal in the project folder and activate the virtual environment first:
 
 ```bash
-python -m venv .venv
+cd C:\PulseVision
 ```
-
-Activate it on Windows:
 
 ```bash
 .venv\Scripts\activate
 ```
 
-
-
-Then install the packages:
-
-
-
-## Run
+Start PulseVision:
 
 ```bash
 streamlit run app.py
 ```
 
-The dashboard opens in the browser at http://localhost:8501.
+The dashboard opens in the browser at http://localhost:8501. The first start takes a little
+longer because the face model is downloaded.
+
+To also get system notifications, open a **second** terminal, activate the virtual
+environment there too, and start the Notification app:
+
+```bash
+streamlit run notification_app.py --server.port 8502
+```
+
+It opens at http://localhost:8502. To stop either app, press `Ctrl + C` in its terminal.
+
+## Using the dashboard
 
 1. Turn on **Start measurement** in the sidebar to open the webcam.
 2. Green **Forehead** and **Cheek** boxes appear on the face when it is detected
@@ -175,6 +250,20 @@ Notifications use the operating system's own notification system (on Windows thr
 shown as "Windows PowerShell"), so nothing extra is installed and nothing leaves the device.
 If no notification appears, check that Windows notifications and Focus Assist / Do Not Disturb allow it.
 
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `pip install` fails with *No such file or directory* and mentions **Long Path** | The project folder path is too long. Clone it into a short path such as `C:\PulseVision` (setup step 2) |
+| `pip install` cannot find `mediapipe` | The Python version is not supported. Use Python 3.10 - 3.13 |
+| `'python' is not recognized` | Python was installed without *Add python.exe to PATH*. Reinstall and tick that box |
+| `'streamlit' is not recognized` or `No module named ...` | The virtual environment is not active. Run `.venv\Scripts\activate` first |
+| *Could not open the webcam* | Close other apps using the camera (Zoom, Teams, Camera app), open PulseVision in only one browser tab, and check Windows Settings -> Privacy & security -> Camera -> allow desktop apps |
+| First start fails while downloading the face model | Connect to the internet once; the model is then saved in `models/` |
+| The heart rate stays at `--` with *Signal quality is poor* | Sit 50-70 cm from the camera with light on the front of the face and stay still (see Tips below) |
+| No Windows notifications appear | Keep the Notification app running, check Focus Assist / Do Not Disturb, and allow notifications for *Windows PowerShell* in Windows Settings -> System -> Notifications |
+| *Port 8501 is already in use* | PulseVision is already running in another terminal - use that one, or close it first |
+
 ## Tips for a good signal
 
 - Sit about **50-70 cm** from the webcam and face it directly.
@@ -199,6 +288,8 @@ PulseVision/
 ├── notifier.py             Shows a system notification on this device
 ├── requirements.txt
 ├── README.md
+├── models/
+│   └── face_landmarker.task  MediaPipe face model, downloaded automatically on first run
 └── data/
     └── pulsevision.db      Created automatically on first use (readings and alerts)
 ```
