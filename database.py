@@ -37,19 +37,27 @@ def connect():
                quality    TEXT NOT NULL
            )"""
     )
+    extra = ",\n".join(f"{column} {column_type}" for column, column_type in ALERT_EXTRA_COLUMNS.items())
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS alerts (
+        f"""CREATE TABLE IF NOT EXISTS alerts (
                id         INTEGER PRIMARY KEY AUTOINCREMENT,
                session_id TEXT NOT NULL,
                timestamp  TEXT NOT NULL,
                kind       TEXT NOT NULL,
-               message    TEXT NOT NULL
+               message    TEXT NOT NULL,
+               {extra}
            )"""
     )
+    # Upgrade an alerts table made by an older version of PulseVision
     existing = {row[1] for row in conn.execute("PRAGMA table_info(alerts)")}
     for column, column_type in ALERT_EXTRA_COLUMNS.items():
         if column not in existing:
-            conn.execute(f"ALTER TABLE alerts ADD COLUMN {column} {column_type}")
+            try:
+                conn.execute(f"ALTER TABLE alerts ADD COLUMN {column} {column_type}")
+            except sqlite3.OperationalError as error:
+                # The other app added the same column at the same moment - that is fine
+                if "duplicate column" not in str(error):
+                    raise
     return conn
 
 
