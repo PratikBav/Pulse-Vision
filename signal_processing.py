@@ -2,6 +2,8 @@
 
 Phase 2: a rolling buffer that keeps the last few seconds of mean RGB values.
 Phase 4: resampling, band-pass filter, FFT, heart rate, signal quality and smoothing.
+Movement: BPMSmoother rejects unconfirmed jumps; HeartRateTracker holds the last good
+reading while the signal window restarts after movement.
 """
 
 from collections import deque
@@ -135,13 +137,39 @@ def signal_quality(peak_ratio):
 
 
 class BPMSmoother:
-    """Moving average of the most recent BPM estimates, so the displayed value is stable."""
+    """Moving average of the most recent BPM estimates, so the displayed value is stable.
+
+    A heart rate cannot jump by a large amount from one second to the next, so an
+    estimate far from the current average is treated as suspicious. It is only
+    accepted if the next estimates confirm it (a real change); otherwise it is ignored.
+    """
+
+    MAX_JUMP_BPM = 12   # estimates further than this from the average are suspicious
+    CONFIRMATIONS = 3   # this many similar suspicious estimates in a row = a real change
 
     def __init__(self, size=5):
         self.values = deque(maxlen=size)
+        self.suspicious = []
 
     def add(self, bpm):
-        self.values.append(bpm)
+        """Add an estimate. Returns True if it was accepted into the average."""
+        current = self.value()
+        if current is None or abs(bpm - current) <= self.MAX_JUMP_BPM:
+            self.values.append(bpm)
+            self.suspicious = []
+            return True
+
+        # Far from the average: keep it aside until it is confirmed
+        if self.suspicious and abs(bpm - self.suspicious[-1]) > self.MAX_JUMP_BPM:
+            self.suspicious = []
+        self.suspicious.append(bpm)
+        if len(self.suspicious) >= self.CONFIRMATIONS:
+            # The new value is stable, so the heart rate really changed
+            self.values.clear()
+            self.values.extend(self.suspicious)
+            self.suspicious = []
+            return True
+        return False
 
     def value(self):
         """Smoothed BPM, or None if there are no estimates yet."""
@@ -151,3 +179,51 @@ class BPMSmoother:
 
     def clear(self):
         self.values.clear()
+        self.suspicious = []
+
+
+class HeartRateTracker:
+    """Decides which heart rate to show, so that movement and noise cannot disturb it.
+
+    - Poor-quality estimates are never used.
+    - Sudden jumps must be confirmed before they are accepted (see BPMSmoother).
+    - When the patient moves, the signal window starts again. Meanwhile the last
+      good reading is "held" (shown but marked as held) for up to HOLD_SECONDS.
+    """
+
+    HOLD_SECONDS = 20
+
+    def __init__(self):
+        self.smoother = BPMSmoother()
+        self.quality = None          # quality of the latest estimate, None while collecting
+        self.last_accepted = None    # time of the last accepted estimate
+
+    def update(self, now, raw_bpm, peak_ratio):
+        """Use a new estimate. Returns True if it was accepted into the shown value."""
+        self.quality = signal_quality(peak_ratio) if raw_bpm is not None else "Poor"
+        if self.quality == "Poor":
+            return False
+        accepted = self.smoother.add(raw_bpm)
+        if accepted:
+            self.last_accepted = now
+        return accepted
+
+    def restart_window(self):
+        """Called when the patient moves: the old signal is thrown away, the reading is held."""
+        self.quality = None
+
+    def reset(self):
+        """Called when the patient leaves: forget everything."""
+        self.smoother.clear()
+        self.quality = None
+        self.last_accepted = None
+
+    def shown_value(self, now):
+        """Return (bpm, held). bpm is None when nothing should be shown."""
+        if self.last_accepted is not None and now - self.last_accepted > self.HOLD_SECONDS:
+            self.smoother.clear()  # the held value is too old to be trusted
+            self.last_accepted = None
+        bpm = self.smoother.value()
+        if bpm is None or self.quality == "Poor":
+            return None, False
+        return bpm, self.quality is None
