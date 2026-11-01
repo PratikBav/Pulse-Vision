@@ -1,7 +1,9 @@
-"""Face detection and facial landmarks using MediaPipe Face Landmarker."""
+"""Face detection, facial landmarks (MediaPipe Face Landmarker) and head-movement detection."""
 
+import math
 import os
 import urllib.request
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -53,6 +55,46 @@ class FaceMeshDetector:
 
     def close(self):
         self.landmarker.close()
+
+
+class MotionDetector:
+    """Detects head movement from the facial landmarks.
+
+    It compares the nose position and the face width now with their values
+    0.5 s ago. Movement is measured as a fraction of the face width, so it
+    works the same whether the person sits near or far from the camera.
+    Turning or tilting the head moves the nose; leaning in or out changes the width.
+    """
+
+    NOSE_TIP = 1
+    FACE_LEFT = 234
+    FACE_RIGHT = 454
+    LOOKBACK_SECONDS = 0.5
+    THRESHOLD = 0.06  # moved more than 6% of the face width in 0.5 s -> "moving"
+
+    def __init__(self):
+        self.history = deque()  # (time, nose x, nose y, face width)
+
+    def update(self, timestamp, landmarks):
+        """Add the current landmarks and return the amount of movement (0 = perfectly still)."""
+        nose_x, nose_y = landmarks[self.NOSE_TIP]
+        width = abs(landmarks[self.FACE_RIGHT][0] - landmarks[self.FACE_LEFT][0])
+        self.history.append((timestamp, nose_x, nose_y, width))
+        while timestamp - self.history[0][0] > self.LOOKBACK_SECONDS:
+            self.history.popleft()
+        if width == 0:
+            return 0.0
+
+        _, old_x, old_y, old_width = self.history[0]
+        shift = math.hypot(nose_x - old_x, nose_y - old_y) / width
+        resize = abs(width - old_width) / width
+        return max(shift, resize)
+
+    def is_moving(self, motion):
+        return motion > self.THRESHOLD
+
+    def reset(self):
+        self.history.clear()
 
 
 def draw_landmarks(frame, landmarks, color=(0, 255, 0)):
