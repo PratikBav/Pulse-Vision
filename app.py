@@ -159,21 +159,10 @@ def show_trend(placeholder):
     draw_line_chart(placeholder, df, "Time", ["BPM"], [PULSE_COLOR], "BPM", x_type="temporal")
 
 
-def show_alert_log(placeholder):
-    """List the most recent alerts of this session."""
-    alerts = st.session_state.get("alerts", [])
-    if alerts:
-        placeholder.markdown("\n".join(f"- {a}" for a in reversed(alerts[-5:])))
-    else:
-        placeholder.caption("No alerts.")
-
-
-def deliver_alert(alert, log_placeholder):
+def deliver_alert(alert):
     """Show the alert as a pop-up and save it (the Notification app picks it up from the database)."""
     timestamp = datetime.now().isoformat(timespec="seconds")
-    st.session_state.setdefault("alerts", []).append(f"{timestamp[11:]} **{alert.kind}** - {alert.message}")
     save_alert(st.session_state.session_id, timestamp, alert)
-    show_alert_log(log_placeholder)
 
     icon = ":material/notifications:" if alert.quiet else ":material/warning:"
     st.toast(alert.message, icon=icon)
@@ -199,7 +188,6 @@ with st.sidebar:
         st.session_state.session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
         st.session_state.readings = []
         st.session_state.saved_count = 0
-        st.session_state.alerts = []
     st.session_state.was_running = running
 
     st.divider()
@@ -222,8 +210,7 @@ with st.sidebar:
     high_bpm = st.number_input("High heart rate alert above (BPM)", min_value=80, max_value=180,
                                value=HIGH_BPM_DEFAULT, step=5, key="high_bpm",
                                help="An alert is raised as soon as a shown heart rate goes above this.")
-    alert_log = st.empty()
-    show_alert_log(alert_log)
+    st.caption("Alerts are listed in the Notification app (http://localhost:8502).")
 
 col_video, col_vitals = st.columns([3, 2], gap="large")
 with col_video:
@@ -302,7 +289,7 @@ try:
 
         alert = monitor.update_face(timestamp, patient_present)
         if alert:
-            deliver_alert(alert, alert_log)
+            deliver_alert(alert)
 
         moving = False
         if not patient_present:
@@ -355,7 +342,7 @@ try:
                         # ---- Alerts: high heart rate, sharp fluctuation (quiet) ----
                         for alert in monitor.update_heart_rate(timestamp, shown_bpm, high_bpm,
                                                                tracker.quality):
-                            deliver_alert(alert, alert_log)
+                            deliver_alert(alert)
 
                     in_range = (freqs * 60 >= MIN_BPM - 10) & (freqs * 60 <= MAX_BPM + 10)
                     spectrum = pd.DataFrame({"Heart rate (BPM)": freqs[in_range] * 60,
