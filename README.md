@@ -128,7 +128,7 @@ showed up to 97 BPM after a movement; the new method stayed within 1 BPM of 72.
 | Alert | When | In PulseVision | System notification |
 |-------|------|----------------|---------------------|
 | Patient not present | No face in front of the camera for **10 seconds** (once per absence) | Pop-up and a red banner until the patient returns | Yes |
-| High heart rate | The heart rate stays above the threshold (default **120 BPM**, set in the sidebar) for **10 seconds** | Pop-up, and the number on the card turns red | Yes |
+| High heart rate | A shown heart rate goes above the threshold (default **120 BPM**, set in the sidebar). Once per rise above the limit, at most once a minute | Pop-up, and the number on the card turns red | Yes |
 | Heart rate fluctuation | The heart rate changes by more than **25 BPM** within **30 seconds** (at most once a minute) | Quiet pop-up | Off by default |
 
 Every alert records the **condition** that fired and the **readings at that moment** (current or
@@ -159,9 +159,9 @@ How it works:
 3. For each new alert it shows a notification, for example:
 
    > **PulseVision: High heart rate**
-   > Condition: Heart rate above 120 BPM for 10 s
-   > Current heart rate 128 BPM (Good signal). Above the limit since 14:05:10 (10 s): lowest 122,
-   > highest 131 BPM. (at 14:05:20)
+   > Condition: Heart rate above 120 BPM
+   > Heart rate 128 BPM (Good signal) at 14:05:20, 8 BPM above the limit. Recent readings:
+   > 112, 115, 118, 128 BPM. (at 14:05:20)
 
 4. It records what it did in the same row (`notify_status`, `notified_at`), e.g. *Notification shown*.
 

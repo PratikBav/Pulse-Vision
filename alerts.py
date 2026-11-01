@@ -16,7 +16,7 @@ FLUCTUATION_WINDOW_SECONDS = 30    # look at the shown heart rate over this peri
 FLUCTUATION_BPM = 25               # ...and alert if it changes by more than this
 FLUCTUATION_COOLDOWN_SECONDS = 60  # do not repeat the fluctuation alert more often than this
 HIGH_BPM_DEFAULT = 120             # default "high heart rate" threshold (can be changed in the dashboard)
-HIGH_BPM_SECONDS = 10              # the heart rate must stay above the threshold this long
+HIGH_BPM_COOLDOWN_SECONDS = 60     # at least this long between two high-heart-rate alerts
 
 ABSENT = "Patient not present"
 FLUCTUATION = "Heart rate fluctuation"
@@ -47,9 +47,8 @@ class AlertMonitor:
         self.absence_alerted = False
         self.recent_bpm = deque()  # (time in seconds, bpm) of shown heart rates
         self.last_fluctuation_time = None
-        self.high_since = None     # when the heart rate first went above the threshold
-        self.high_values = []      # heart rates recorded while above the threshold
-        self.high_alerted = False
+        self.high_alerted = False  # True while the heart rate stays above the threshold after an alert
+        self.last_high_time = None # when the last high-heart-rate alert fired
         self.last_bpm = None       # last recorded heart rate, its quality and time
         self.last_quality = None
         self.last_bpm_time = None
@@ -63,8 +62,6 @@ class AlertMonitor:
 
         # The measurement restarts when the face returns, so old heart rates no longer apply
         self.recent_bpm.clear()
-        self.high_since = None
-        self.high_values = []
         self.high_alerted = False
         if self.face_missing_since is None:
             self.face_missing_since = now
@@ -96,29 +93,29 @@ class AlertMonitor:
         alerts = []
         self.last_bpm, self.last_quality, self.last_bpm_time = bpm, quality, now
 
-        # High heart rate: above the threshold for HIGH_BPM_SECONDS in a row
+        # High heart rate: as soon as a shown reading goes above the threshold.
+        # Shown readings are already smoothed and quality-checked, so one noisy estimate
+        # cannot cause this. It fires once per rise above the threshold, and at most once
+        # every HIGH_BPM_COOLDOWN_SECONDS so a value hovering around the limit does not spam.
+        previous = [b for _, b in self.recent_bpm][-4:]
         if bpm > high_threshold:
-            if self.high_since is None:
-                self.high_since = now
-                self.high_values = []
-            self.high_values.append(bpm)
-            above_for = now - self.high_since
-            if not self.high_alerted and above_for >= HIGH_BPM_SECONDS:
+            cooled_down = (self.last_high_time is None
+                           or now - self.last_high_time >= HIGH_BPM_COOLDOWN_SECONDS)
+            if not self.high_alerted and cooled_down:
                 self.high_alerted = True
+                self.last_high_time = now
+                recent = ", ".join(f"{b:.0f}" for b in previous + [bpm])
                 alerts.append(Alert(
                     HIGH_HEART_RATE,
                     f"High heart rate: {bpm:.0f} BPM (limit {high_threshold:.0f} BPM).",
-                    condition=f"Heart rate above {high_threshold:.0f} BPM for {HIGH_BPM_SECONDS} s",
-                    details=(f"Current heart rate {bpm:.0f} BPM ({quality} signal). Above the limit since "
-                             f"{clock(above_for)} ({above_for:.0f} s): lowest {min(self.high_values):.0f}, "
-                             f"highest {max(self.high_values):.0f} BPM."),
+                    condition=f"Heart rate above {high_threshold:.0f} BPM",
+                    details=(f"Heart rate {bpm:.0f} BPM ({quality} signal) at {clock()}, "
+                             f"{bpm - high_threshold:.0f} BPM above the limit. Recent readings: {recent} BPM."),
                     bpm=bpm,
                     quality=quality,
                 ))
         else:
-            self.high_since = None
-            self.high_values = []
-            self.high_alerted = False
+            self.high_alerted = False  # back at or below the limit: the next rise alerts again
 
         # Fluctuation: the heart rate changed by more than FLUCTUATION_BPM within the window
         self.recent_bpm.append((now, bpm))

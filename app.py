@@ -17,7 +17,7 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from alerts import HIGH_BPM_DEFAULT, HIGH_BPM_SECONDS, AlertMonitor
+from alerts import HIGH_BPM_DEFAULT, AlertMonitor
 from camera import Camera
 from database import save_alert, save_readings
 from face import FaceMeshDetector, MotionDetector, draw_landmarks
@@ -221,7 +221,7 @@ with st.sidebar:
     st.subheader("Alerts")
     high_bpm = st.number_input("High heart rate alert above (BPM)", min_value=80, max_value=180,
                                value=HIGH_BPM_DEFAULT, step=5, key="high_bpm",
-                               help=f"An alert pops up when the heart rate stays above this for {HIGH_BPM_SECONDS} s.")
+                               help="An alert is raised as soon as a shown heart rate goes above this.")
     alert_log = st.empty()
     show_alert_log(alert_log)
 
