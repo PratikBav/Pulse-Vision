@@ -28,7 +28,8 @@ Webcam -> Face detection -> Forehead ROI -> Mean RGB per frame -> Rolling buffer
 | 7. Filtering | Butterworth band-pass filter (order 3, 0.6-3.3 Hz) removes slow drift and fast noise | Done |
 | 8. Heart rate | FFT finds the strongest frequency between 40 and 180 BPM, BPM = frequency x 60 | Done |
 | 9. Smoothing and quality | Moving average of the last 5 estimates, and a Good / Fair / Poor signal quality indicator | Done |
-| 10. Storage and history | Readings saved to SQLite with average, minimum and maximum BPM | Planned |
+| 10. Storage | Shown readings (timestamp, BPM, quality, session ID) saved to SQLite with **Save session** | Done |
+| 11. History | BPM history graph with average, minimum and maximum BPM | Planned |
 
 ## Technology
 
@@ -69,8 +70,14 @@ The dashboard opens in the browser at http://localhost:8501.
 3. Stay still while the signal is collected (**Collecting signal... x / 10 s**).
 4. The **Estimated Heart Rate** and **Signal Quality** are then updated every second.
 5. The **Pulse signal** chart shows the filtered pulse waveform - each peak is one heartbeat.
-6. Open **Signal details (debug)** to see the frequency spectrum and the raw forehead colour.
-7. Tick **Show facial landmarks** to see all detected face points.
+6. Click **Save session** to store the readings in the database (`data/pulsevision.db`).
+   You can save while measuring or after switching measurement off; only new readings are added.
+7. Open **Signal details (debug)** to see the frequency spectrum and the raw forehead colour.
+8. Tick **Show facial landmarks** to see all detected face points.
+
+Each time **Start measurement** is switched on, a new session begins (its ID is the start
+date and time, e.g. `20261101-153938`). A reading is recorded once per second, only while a
+heart rate is shown - readings with poor signal quality are never recorded.
 
 Open the dashboard in **only one browser tab** - the webcam can be used by one tab at a time.
 
@@ -107,14 +114,18 @@ PulseVision/
 ├── roi.py                  Forehead region of interest and mean RGB
 ├── rppg.py                 POS method: RGB signal -> pulse signal
 ├── signal_processing.py    RGB buffer, resampling, band-pass filter, FFT, BPM, quality, smoothing
+├── database.py             SQLite storage of readings
 ├── requirements.txt
-└── README.md
+├── README.md
+└── data/
+    └── pulsevision.db      Created automatically when a session is first saved
 ```
 
 ## Privacy
 
 - Video frames are processed in memory and are **never saved**.
-- Only numbers (average colour values, and later heart-rate readings) are kept.
+- Only numbers are kept: average colour values in memory, and saved heart-rate readings
+  (timestamp, BPM, quality, session ID) in the local SQLite database.
 
 ## Progress
 
@@ -122,5 +133,6 @@ PulseVision/
 - [x] Phase 2 - Mean RGB per frame, timestamps, rolling 12 s buffer, live RGB plots
 - [x] Phase 3 - POS rPPG pulse extraction and live pulse waveform
 - [x] Phase 4 - Band-pass filter, FFT, BPM, smoothing and signal quality (end-to-end heart rate)
-- [ ] SQLite storage and heart-rate history
+- [x] SQLite storage of readings with a Save session button
+- [ ] Heart-rate history graph with average, minimum and maximum BPM
 - [ ] Validation against a reference device (pulse oximeter / smartwatch)

@@ -4,15 +4,18 @@ Phase 1: webcam preview, face detection, facial landmarks and forehead ROI.
 Phase 2: mean RGB extraction from the forehead, rolling 12 s buffer, live RGB plots.
 Phase 3: POS rPPG pulse waveform.
 Phase 4: band-pass filter, FFT, BPM, smoothing and signal quality.
+Storage: readings are kept per session and saved to SQLite with "Save session".
 Run with:  streamlit run app.py
 """
 
 import time
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
 from camera import Camera
+from database import save_readings
 from face import FaceMeshDetector, draw_landmarks
 from roi import draw_roi, extract_roi_pixels, get_forehead_roi, mean_rgb
 from rppg import pos
@@ -52,6 +55,17 @@ def draw_line_chart(placeholder, df, x, columns, colors, y_title):
     placeholder.vega_lite_chart(df, spec, width="stretch")
 
 
+def show_session_status(placeholder):
+    """Show how many readings the current session has, and how many are not saved yet."""
+    session_id = st.session_state.get("session_id")
+    if session_id is None:
+        placeholder.caption("No session yet - start a measurement.")
+        return
+    total = len(st.session_state.readings)
+    unsaved = total - st.session_state.saved_count
+    placeholder.caption(f"Session {session_id}: {total} readings, {unsaved} not saved")
+
+
 st.set_page_config(page_title="PulseVision", layout="wide")
 st.title("PulseVision")
 st.caption("Computer Vision Based Non Contact Heart Rate Detection Using Facial Video")
@@ -61,6 +75,28 @@ col_video, col_info = st.columns([2, 1])
 with col_info:
     running = st.toggle("Start measurement")
     show_landmarks = st.checkbox("Show facial landmarks")
+
+    # st.session_state keeps values between Streamlit reruns (e.g. when a button is
+    # clicked), so the readings are not lost. Switching measurement on starts a new session.
+    if running and not st.session_state.get("was_running", False):
+        st.session_state.session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        st.session_state.readings = []
+        st.session_state.saved_count = 0
+    st.session_state.was_running = running
+
+    save_clicked = st.button("Save session")
+    save_message = st.empty()
+    session_status = st.empty()
+    if save_clicked:
+        new_readings = st.session_state.get("readings", [])[st.session_state.get("saved_count", 0):]
+        if not new_readings:
+            save_message.info("No new readings to save yet.")
+        else:
+            save_readings(st.session_state.session_id, new_readings)
+            st.session_state.saved_count += len(new_readings)
+            save_message.success(f"Saved {len(new_readings)} readings to the database.")
+    show_session_status(session_status)
+
     heart_rate_metric = st.empty()
     quality_metric = st.empty()
     face_status = st.empty()
@@ -154,6 +190,15 @@ try:
                     else:
                         smoother.add(raw_bpm)
                     heart_rate = smoother.value()
+
+                    # Record the value shown to the user (poor-quality results are never recorded)
+                    if heart_rate is not None:
+                        st.session_state.readings.append({
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "bpm": round(heart_rate, 1),
+                            "quality": quality,
+                        })
+                        show_session_status(session_status)
 
                     in_range = (freqs * 60 >= MIN_BPM - 10) & (freqs * 60 <= MAX_BPM + 10)
                     spectrum = pd.DataFrame({"Heart rate (BPM)": freqs[in_range] * 60,
