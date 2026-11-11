@@ -1,40 +1,25 @@
 # PulseVision
 
-**Computer Vision Based Non Contact Heart Rate Detection Using Facial Video**
+**Computer Vision & Hardware Sensor Non-Contact / Contact Patient Monitoring Prototype**
 
-PulseVision estimates a person's heart rate using only a laptop webcam and their face.
-No sensor touches the body. It uses **remote photoplethysmography (rPPG)**: every
-heartbeat pushes blood into the skin, which changes the skin colour very slightly
-(about 1%). The camera can pick up this tiny change even though our eyes cannot.
+PulseVision combines:
+1. **Computer-vision heart rate estimation (rPPG)** using a laptop webcam and MediaPipe Face Landmarker.
+2. **Hardware sensor measurements** from an Arduino UNO R4 WiFi over USB serial:
+   - **Sensor 1:** `MAX30100` pulse oximeter (heart rate BPM & uncalibrated SpO2 %).
+   - **Sensor 2:** `MPU9250 / MPU6500 / MPU9255` 6/9-axis IMU (3-axis acceleration, angular velocity, and peak dynamic motion `motion_g` in `g`).
+3. **Unified monitoring, configurable alert rules, local SQLite logging, and SMTP email notifications.**
 
-> **Disclaimer:** PulseVision shows an *Estimated Heart Rate*. It is a college
-> project for learning purposes and is **not a medical device**. Do not use it for
+> **Disclaimer:** PulseVision shows an *Estimated Heart Rate* and *uncalibrated SpO2*. It is a college
+> project for learning purposes and is **not a medical device**. Do not use it for clinical decisions.
 
 ## How it works
 
 ```
-Webcam -> Face detection -> Forehead ROI -> Mean RGB per frame -> Rolling buffer -> Resample
-       -> POS rPPG pulse signal -> Band-pass filter -> FFT -> BPM -> Smoothing -> Dashboard -> Saved readings
+Webcam  -> Face detection -> Forehead ROI -> Mean RGB -> Rolling buffer -> Resample -> POS rPPG -> Band-pass -> FFT -> BPM
+Arduino -> MAX30100 + MPU9250/6500/9255 -> USB Serial (NDJSON @ 115200) -> Background SerialReader
+        -> Unified Snapshot (1 Hz) -> AlertEngine (HR / SpO2 / Motion / Absence / Disagreement / Faults)
+        -> SQLite (monitor_log & alerts) + Non-blocking SMTP Email Notifier
 ```
-
-| Step | What happens | Status |
-|------|--------------|--------|
-| 1. Capture | OpenCV reads frames from the webcam | Done |
-| 2. Face detection | MediaPipe Face Landmarker finds the face and 478 landmarks | Done |
-| 3. Region of interest | A forehead box is placed using the landmarks, so it follows the head | Done |
-| 4. RGB signal | The average red, green and blue value of the forehead is recorded every frame with a timestamp | Done |
-| 5. Rolling buffer | The last 12 seconds of RGB values are kept in memory | Done |
-| 6. Pulse extraction | The RGB signal is resampled to an even 30 samples/s, then the POS (Plane-Orthogonal-to-Skin) method turns it into one pulse signal | Done |
-| 7. Filtering | Butterworth band-pass filter (order 3, 0.6-3.3 Hz) removes slow drift and fast noise | Done |
-| 8. Heart rate | FFT finds the strongest frequency between 40 and 180 BPM, BPM = frequency x 60 | Done |
-| 9. Smoothing and quality | Moving average of the last 5 estimates, and a Good / Fair / Poor signal quality indicator | Done |
-| 10. Storage | Shown readings (timestamp, BPM, quality, session ID) saved to SQLite with **Save session** | Done |
-| 11. History | BPM history graph with average, minimum and maximum BPM | Planned |
-
-## Technology
-
-Python 3.10+, OpenCV, MediaPipe, NumPy, SciPy, Streamlit, Pandas and SQLite.
-Everything runs locally on a normal laptop - no cloud services.
 
 ## Setup
 
@@ -43,19 +28,9 @@ Everything runs locally on a normal laptop - no cloud services.
 
 ```bash
 python -m venv .venv
-```
-
-Activate it on Windows:
-
-```bash
 .venv\Scripts\activate
+pip install -r requirements.txt
 ```
-
-
-
-Then install the packages:
-
-
 
 ## Run
 
@@ -65,74 +40,40 @@ streamlit run app.py
 
 The dashboard opens in the browser at http://localhost:8501.
 
-1. Turn on **Start measurement** to open the webcam.
-2. A green **Forehead** box appears on your face when it is detected.
-3. Stay still while the signal is collected (**Collecting signal... x / 10 s**).
-4. The **Estimated Heart Rate** and **Signal Quality** are then updated every second.
-5. The **Pulse signal** chart shows the filtered pulse waveform - each peak is one heartbeat.
-6. Click **Save session** to store the readings in the database (`data/pulsevision.db`).
-   You can save while measuring or after switching measurement off; only new readings are added.
-7. Open **Signal details (debug)** to see the frequency spectrum and the raw forehead colour.
-8. Tick **Show facial landmarks** to see all detected face points.
+## Arduino Hardware Setup
 
-Each time **Start measurement** is switched on, a new session begins (its ID is the start
-date and time, e.g. `20261101-153938`). A reading is recorded once per second, only while a
-heart rate is shown - readings with poor signal quality are never recorded.
+1. **Firmware:** Open `firmware/pulsevision_sensors/pulsevision_sensors.ino` in the Arduino IDE (or compile with `arduino-cli` for `arduino:renesas_uno:unor4wifi`) and upload it to your **Arduino UNO R4 WiFi**.
+   - **Wiring (shared I2C bus on pins `A4` SDA / `A5` SCL, 3.3V):**
+     - `MAX30100` (I2C `0x57`): `VIN -> 3.3V`, `GND -> GND`, `SDA -> A4`, `SCL -> A5`
+     - `MPU9250 / MPU6500 / MPU9255` (I2C `0x68` or `0x69` auto-detected): `VCC -> 3.3V`, `GND -> GND`, `SDA -> A4`, `SCL -> A5`
+   - Note: Close the Arduino IDE Serial Monitor before connecting in PulseVision so the COM port is not locked.
+2. **Serial format (115200 baud, newline-delimited JSON, 1 Hz):**
+   ```json
+   {"t_ms":12345,"max30100":{"ok":true,"hr_bpm":72.4,"spo2_pct":97},"mpu":{"ok":true,"ax":-0.02,"ay":0.01,"az":0.99,"a_g":1.00,"motion_g":0.02,"gx":0.4,"gy":-0.2,"gz":0.1}}
+   ```
+   - `motion_g` is the peak dynamic acceleration (`|accelSqrt() - 1.0g|`, sampled at 20 Hz over each 1 s window) so sudden patient movement, agitation, or falls between 1 s reports are captured (`~0.00 g` at rest).
+   - Select **`MOCK (simulated)`** in the sidebar port dropdown to test the full pipeline without physical hardware (simulated readings are explicitly labeled).
 
-Open the dashboard in **only one browser tab** - the webcam can be used by one tab at a time.
+## Configuring Alerts & Email Notifications
 
-### Signal quality
+- All alert rules start **disabled** (`None`) — no clinical thresholds are hardcoded.
+- Open the sidebar **Alert settings** expander to configure:
+  - Upper/lower limits for **Sensor HR**, **Sensor SpO2**, **Sensor motion / agitation (`g`)**, and **Camera HR**.
+  - Patient absence duration (seconds without face detection).
+  - Sensor vs. camera HR disagreement tolerance (BPM).
+  - Arduino disconnect / sensor fault (`MAX30100` or `MPU`) alerts, confirmation time, and cooldown.
+  - Recipient email address.
+- For email delivery, copy `.env.example` to `.env` and set `PV_SMTP_HOST`, `PV_SMTP_PORT`, `PV_SMTP_USER`, `PV_SMTP_PASSWORD`, and `PV_SMTP_FROM`.
 
-The quality is measured from the frequency spectrum of the pulse: what share of the
-signal's power (between 40 and 180 BPM) lies within +/-6 BPM of the strongest peak.
+## Running Tests
 
-| Quality | Peak power ratio | What the app does |
-|---------|------------------|-------------------|
-| Good | 0.60 or more | Shows the estimated heart rate |
-| Fair | 0.45 - 0.60 | Shows the estimated heart rate |
-| Poor | below 0.45 | Shows no heart rate and asks you to stay still and improve lighting |
-
-A clean pulse puts most of its power in one clear peak; noise and movement spread it out.
-The thresholds were chosen by testing with synthetic signals, where pure noise stayed
-below 0.45 and clear pulses scored about 0.7-0.9.
-
-## Tips for a good signal
-
-- Sit about **50-70 cm** from the webcam and face it directly.
-- Use steady light falling on the **front of your face** (avoid a bright window behind you).
-- Keep your forehead visible - move hair away from it.
-- **Stay still and avoid talking** while measuring. Movement causes colour changes far
-  larger than the pulse itself.
-
-## Project structure
-
-```
-PulseVision/
-├── app.py                  Streamlit dashboard and main loop
-├── camera.py               Webcam access (OpenCV)
-├── face.py                 Face detection and landmarks (MediaPipe)
-├── roi.py                  Forehead region of interest and mean RGB
-├── rppg.py                 POS method: RGB signal -> pulse signal
-├── signal_processing.py    RGB buffer, resampling, band-pass filter, FFT, BPM, quality, smoothing
-├── database.py             SQLite storage of readings
-├── requirements.txt
-├── README.md
-└── data/
-    └── pulsevision.db      Created automatically when a session is first saved
+```bash
+pytest -q
 ```
 
-## Privacy
+## Firebase Notifications
 
-- Video frames are processed in memory and are **never saved**.
-- Only numbers are kept: average colour values in memory, and saved heart-rate readings
-  (timestamp, BPM, quality, session ID) in the local SQLite database.
-
-## Progress
-
-- [x] Phase 1 - Camera, face detection, landmarks, forehead ROI, live preview
-- [x] Phase 2 - Mean RGB per frame, timestamps, rolling 12 s buffer, live RGB plots
-- [x] Phase 3 - POS rPPG pulse extraction and live pulse waveform
-- [x] Phase 4 - Band-pass filter, FFT, BPM, smoothing and signal quality (end-to-end heart rate)
-- [x] SQLite storage of readings with a Save session button
-- [ ] Heart-rate history graph with average, minimum and maximum BPM
-- [ ] Validation against a reference device (pulse oximeter / smartwatch)
+The dashboard includes a refreshable **Notifications & Alerts** tab with a
+server-side Firebase/Firestore integration and optional FCM/MSG91 delivery.
+Setup, required credentials, delivery-state semantics, and deployment commands
+are documented in [FIREBASE_NOTIFICATIONS.md](./FIREBASE_NOTIFICATIONS.md).
