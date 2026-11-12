@@ -16,10 +16,13 @@ background thread so a slow or failing mail server never blocks monitoring.
 
 import logging
 import os
+import queue
 import smtplib
 import ssl
 import threading
 from email.message import EmailMessage
+
+from dotenv import dotenv_values
 
 log = logging.getLogger("pulsevision.notifier")
 
@@ -28,39 +31,60 @@ SMTP_TIMEOUT_SECONDS = 15
 
 
 def load_env_file(path=ENV_FILE):
-    """Load KEY=VALUE lines from .env without overriding variables already set."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    except FileNotFoundError:
-        pass
+    """Load non-SMTP integration settings without copying mail secrets globally."""
+    values = dotenv_values(path)
+    for key, value in values.items():
+        if value is None or key.startswith(("PV_SMTP", "SMTP_", "PV_ALERT", "ALERT_RECIPIENT")):
+            continue
+        os.environ.setdefault(key, value)
+
+
+def _env_value(values, *names, default=""):
+    for name in names:
+        if os.environ.get(name) is not None:
+            return os.environ[name]
+        if values.get(name) is not None:
+            return values[name]
+    return default
 
 
 def smtp_settings():
     """Return the SMTP settings from the environment (password included - do not log)."""
-    load_env_file()
-    user = os.environ.get("PV_SMTP_USER", "")
+    values = dotenv_values(ENV_FILE)
+    user = _env_value(values, "PV_SMTP_USER", "SMTP_EMAIL")
     return {
-        "host": os.environ.get("PV_SMTP_HOST", ""),
-        "port": int(os.environ.get("PV_SMTP_PORT", "587") or 587),
+        "host": "smtp.gmail.com",
+        "port": 587,
         "user": user,
-        "password": os.environ.get("PV_SMTP_PASSWORD", ""),
-        "sender": os.environ.get("PV_SMTP_FROM", "") or user,
-        "security": os.environ.get("PV_SMTP_SECURITY", "starttls").lower(),
+        "password": _env_value(values, "PV_SMTP_PASSWORD", "SMTP_APP_PASSWORD"),
+        "sender": _env_value(values, "PV_SMTP_FROM", default=user) or user,
+        "security": "starttls",
     }
+
+
+def default_recipient():
+    """Return the optional recipient from .env without exposing credentials."""
+    values = dotenv_values(ENV_FILE)
+    return _env_value(values, "PV_ALERT_RECIPIENT", "ALERT_RECIPIENT_EMAIL")
+
+
+def mask_email(address):
+    """Keep the activity feed useful without displaying a complete address."""
+    local, separator, domain = (address or "").partition("@")
+    if not separator:
+        return "Not configured"
+    return f"{local[:1]}***@{domain}"
 
 
 def missing_settings(settings=None):
     """Names of required environment variables that are not set."""
     settings = settings or smtp_settings()
-    required = {"PV_SMTP_HOST": settings["host"], "PV_SMTP_FROM / PV_SMTP_USER": settings["sender"]}
-    if settings["user"]:
-        required["PV_SMTP_PASSWORD"] = settings["password"]
+    required = {
+        "PV_SMTP_HOST / SMTP_SERVER": settings["host"],
+        "PV_SMTP_USER / SMTP_EMAIL": settings["user"],
+        "PV_SMTP_PASSWORD / SMTP_APP_PASSWORD": settings["password"],
+        "PV_SMTP_FROM / PV_SMTP_USER": settings["sender"],
+    }
     return [name for name, value in required.items() if not value]
 
 
@@ -109,6 +133,8 @@ class EmailNotifier:
     def __init__(self, sender_func=send_email):
         self._send = sender_func
         self.last_result = None
+        self._queue = queue.Queue()
+        threading.Thread(target=self._run, name="email-alert-queue", daemon=True).start()
 
     def notify(self, alert, recipient, on_done=None):
         """Send the alert email without blocking. on_done(alert, status) is called afterwards."""
@@ -118,9 +144,13 @@ class EmailNotifier:
             return self._finish(alert, "failed: no recipient configured", on_done)
         if missing:
             return self._finish(alert, "failed: email not configured (" + ", ".join(missing) + ")", on_done)
-        threading.Thread(target=self._worker, args=(alert, recipient, settings, on_done),
-                         name="email-alert", daemon=True).start()
+        self._queue.put((alert, recipient, settings, on_done))
         return None
+
+    def _run(self):
+        while True:
+            self._worker(*self._queue.get())
+            self._queue.task_done()
 
     def _worker(self, alert, recipient, settings, on_done):
         try:

@@ -17,6 +17,7 @@ from datetime import datetime
 
 import streamlit as st
 
+import database
 from alerts import Alert, AlertEngine
 from camera import Camera
 from database import save_readings
@@ -24,7 +25,7 @@ from face import FaceMeshDetector, draw_landmarks
 from firebase_notifications import FirebaseNotificationService
 from hardware import MOCK_PORT, SerialReader, detect_arduino_port, list_serial_ports
 from monitor import DataRecorder, PresenceTracker, build_snapshot
-from notifier import EmailNotifier, missing_settings
+from notifier import EmailNotifier, default_recipient, missing_settings
 from notification_ui import render_analytics, render_notification_feed
 from roi import draw_roi, extract_roi_pixels, get_forehead_roi, mean_rgb
 from rppg import pos
@@ -187,7 +188,60 @@ notifier = get_notifier()
 firebase_notifications = get_firebase_notification_service()
 config = load_config()
 
-st.title("PulseVision")
+if "pv_dark_mode" not in st.session_state:
+    st.session_state.pv_dark_mode = True
+
+title_col, theme_col = st.columns([5, 1])
+with title_col:
+    st.title("PulseVision")
+with theme_col:
+    st.toggle("Dark mode", key="pv_dark_mode", help="Switch the dashboard between dark and light mode.")
+
+dark_mode = st.session_state.pv_dark_mode
+theme = {
+    "bg": "#0e1117" if dark_mode else "#f5f7fb",
+    "panel": "#151b24" if dark_mode else "#ffffff",
+    "card": "#17212b" if dark_mode else "#ffffff",
+    "text": "#f5f7fa" if dark_mode else "#1f2937",
+    "muted": "#b6c1cc" if dark_mode else "#536273",
+    "border": "#2a3948" if dark_mode else "#d9e0e8",
+    "ok_bg": "#12352d" if dark_mode else "#e8f7f0",
+    "ok_border": "#236e57" if dark_mode else "#9bd8bf",
+    "warn_bg": "#3c3019" if dark_mode else "#fff5dc",
+    "warn_border": "#8b6a27" if dark_mode else "#e4c36e",
+    "danger_bg": "#3e2025" if dark_mode else "#ffebed",
+    "danger_border": "#8f3944" if dark_mode else "#e4a1a8",
+    "muted_bg": "#202a34" if dark_mode else "#eef2f6",
+    "muted_border": "#3b4b5b" if dark_mode else "#cbd5df",
+}
+st.markdown(
+    f"""
+    <style>
+    :root {{
+      --pv-bg:{theme['bg']}; --pv-panel:{theme['panel']}; --pv-card:{theme['card']};
+      --pv-text:{theme['text']}; --pv-muted:{theme['muted']}; --pv-border:{theme['border']};
+      --pv-status-ok-bg:{theme['ok_bg']}; --pv-status-ok-border:{theme['ok_border']};
+      --pv-status-warn-bg:{theme['warn_bg']}; --pv-status-warn-border:{theme['warn_border']};
+      --pv-status-danger-bg:{theme['danger_bg']}; --pv-status-danger-border:{theme['danger_border']};
+      --pv-status-muted-bg:{theme['muted_bg']}; --pv-status-muted-border:{theme['muted_border']};
+    }}
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] {{ background:var(--pv-bg); color:var(--pv-text); }}
+    [data-testid="stHeader"], section[data-testid="stSidebar"] {{ background:var(--pv-panel); }}
+    [data-testid="stAppViewContainer"] h1, [data-testid="stAppViewContainer"] h2,
+    [data-testid="stAppViewContainer"] h3, [data-testid="stAppViewContainer"] h4,
+    [data-testid="stAppViewContainer"] p, [data-testid="stAppViewContainer"] label {{ color:var(--pv-text); }}
+    [data-testid="stAppViewContainer"] .stCaption, [data-testid="stAppViewContainer"] small {{ color:var(--pv-muted); }}
+    [data-baseweb="input"] > div, [data-baseweb="select"] > div,
+    [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input {{
+      background:var(--pv-card); color:var(--pv-text); border-color:var(--pv-border);
+    }}
+    .stButton > button, [data-testid="stFormSubmitButton"] button {{
+      background:var(--pv-card); color:var(--pv-text); border-color:var(--pv-border);
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.caption("Computer Vision Based Non Contact Heart Rate Detection Using Facial Video")
 
 # ---- Sidebar: Arduino connection and alert settings ----
@@ -255,7 +309,8 @@ with st.sidebar:
                 "Cooldown between alerts of the same kind (s)", value=float(new_cfg["cooldown_seconds"]),
                 min_value=0.0)
             new_cfg["email"]["enabled"] = st.checkbox("Send email alerts", value=new_cfg["email"]["enabled"])
-            new_cfg["email"]["recipient"] = st.text_input("Recipient email", value=new_cfg["email"]["recipient"])
+            new_cfg["email"]["recipient"] = st.text_input(
+                "Recipient email", value=new_cfg["email"]["recipient"] or default_recipient())
             if st.form_submit_button("Save settings"):
                 errors = save_config(new_cfg)
                 if errors:
@@ -268,11 +323,6 @@ with st.sidebar:
         missing = missing_settings()
         if missing:
             st.caption("Email not configured - set " + ", ".join(missing) + " (see .env.example).")
-        if st.button("Send test email"):
-            test = Alert(key="test", category="TEST", message="Test email from PulseVision.",
-                         started_at=time.time(), readings={})
-            result = notifier.notify(test, config["email"]["recipient"])
-            st.info(result or "Sending in the background - click Refresh to see the result.")
         if notifier.last_result:
             st.caption(f"Last email ({notifier.last_result[0]}): {notifier.last_result[1]}")
 
@@ -283,7 +333,11 @@ with tab_analytics:
 with tab_notifications:
     @st.fragment(run_every="2s")
     def live_notification_feed():
-        render_notification_feed(firebase_notifications, config)
+        render_notification_feed(
+            firebase_notifications, config, notifier,
+            active_alerts=list(engine.active.values()),
+            monitoring=st.session_state.get("was_running", False),
+        )
     live_notification_feed()
 
 with tab_live:
@@ -343,6 +397,9 @@ with tab_live:
 
     def on_email_done(alert, status):
         recorder.update_alert(alert.uid, delivery_status=status)
+        database.update_notification_status(
+            alert.uid, "SENT" if status == "sent" else "FAILED", detail=status,
+            failure_reason=None if status == "sent" else status)
 
 
     def monitor_step(camera_status, face_detected, presence, absent_seconds, cam_bpm, cam_quality):
@@ -361,7 +418,10 @@ with tab_live:
             if not alert.notify:
                 continue
             if config["email"]["enabled"]:
-                notifier.notify(alert, config["email"]["recipient"], on_done=on_email_done)
+                result = notifier.notify(
+                    alert, config["email"]["recipient"] or default_recipient(), on_done=on_email_done)
+                if result is None:
+                    database.update_notification_status(alert.uid, "QUEUED", detail="Queued for Gmail SMTP")
             else:
                 alert.delivery_status = "not sent (email alerts disabled)"
                 recorder.update_alert(alert.uid, delivery_status=alert.delivery_status)

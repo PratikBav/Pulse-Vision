@@ -273,3 +273,21 @@ def insert_notification_event(notification_id, status, event_timestamp, detail=N
                 "VALUES (?, ?, ?, ?)",
                 (notification_id, status, event_timestamp, detail),
             )
+
+
+def update_notification_status(notification_id, status, detail=None, failure_reason=None):
+    """Update local delivery state and append one activity-feed event."""
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with connect() as conn:
+        conn.execute(
+            "UPDATE notifications SET delivery_status = ?, failure_reason = ?, updated_at = ? "
+            "WHERE notification_id = ?",
+            (status, failure_reason, timestamp, notification_id),
+        )
+        conn.execute(
+            "INSERT INTO notification_events (notification_id, status, event_timestamp, detail) "
+            "VALUES (?, ?, ?, ?)",
+            (notification_id, status, timestamp, detail),
+        )
