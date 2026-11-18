@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // PulseVision uses Firebase Admin SDK only on its trusted Python server and
+    // Cloud Functions. No browser/client may read recipient configuration or
+    // alter the audit trail directly.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

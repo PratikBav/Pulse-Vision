@@ -1,141 +1,93 @@
 """PulseVision - Streamlit dashboard.
 
 Phase 1: webcam preview, face detection, facial landmarks and forehead ROI.
-Phase 2: mean RGB extraction, rolling 12 s buffer, live RGB plots.
+Phase 2: mean RGB extraction from the forehead, rolling 12 s buffer, live RGB plots.
 Phase 3: POS rPPG pulse waveform.
 Phase 4: band-pass filter, FFT, BPM, smoothing and signal quality.
 Storage: readings are kept per session and saved to SQLite with "Save session".
-Alerts: pop-ups when the patient is not present, the heart rate is high, or it changes sharply.
-Movement: when the patient moves, the signal window restarts and the last reading is held.
+Hardware: Arduino sensors over USB serial, bed presence, alert rules, email alerts
+and a once-per-second monitoring log (hardware.py, monitor.py, alerts.py, notifier.py).
 Run with:  streamlit run app.py
 """
 
+import logging
+import os
 import time
 from datetime import datetime
 
-import cv2
-import pandas as pd
 import streamlit as st
 
-from alerts import HIGH_BPM_DEFAULT, AlertMonitor
+import database
+from alerts import Alert, AlertEngine
 from camera import Camera
-from database import save_alert, save_readings
-from face import FaceMeshDetector, MotionDetector, draw_landmarks
-from roi import draw_roi, get_rois, mean_rgb_of_rois
+from database import save_readings
+from face import FaceMeshDetector, draw_landmarks
+from firebase_notifications import FirebaseNotificationService
+from hardware import MOCK_PORT, SerialReader, detect_arduino_port, list_serial_ports
+from monitor import DataRecorder, PresenceTracker, build_snapshot
+from notifier import EmailNotifier, default_recipient, missing_settings
+from notification_ui import render_analytics, render_notification_feed
+from roi import draw_roi, extract_roi_pixels, get_forehead_roi, mean_rgb
 from rppg import pos
-from signal_processing import (MAX_BPM, MIN_BPM, SAMPLE_RATE, HeartRateTracker, RGBBuffer,
-                               bandpass_filter, find_heart_rate, power_spectrum, resample)
+from settings import METRICS, load_config, save_config
+from signal_processing import (MAX_BPM, MIN_BPM, SAMPLE_RATE, BPMSmoother, RGBBuffer,
+                               bandpass_filter, find_heart_rate, power_spectrum, resample,
+                               signal_quality)
 
 PROCESS_INTERVAL_SECONDS = 1.0  # update heart rate and charts once per second
 MIN_PULSE_SECONDS = 3.0         # need a few seconds of signal before showing the waveform
 MIN_BPM_SECONDS = 10.0          # need several heartbeats before estimating the heart rate
-MOTION_MESSAGE_SECONDS = 1.0    # keep the movement message a moment after movement stops
+MONITOR_INTERVAL_SECONDS = 1.0  # combine hardware + camera, check alerts and log once per second
 POOR_SIGNAL_MESSAGE = "Signal quality is poor. Please remain still and improve lighting."
-RGB_COLORS = ["#e53935", "#43a047", "#1e88e5"]
-PULSE_COLOR = "#e5484d"
-GREEN, ORANGE = (80, 200, 120), (0, 165, 255)  # OpenCV colours are B, G, R
-
-CSS = """
-<style>
-.pv-title {font-size: 2.1rem; font-weight: 800; margin: 0;}
-.pv-title span {color: #e5484d;}
-.pv-sub {opacity: .7; margin: .1rem 0 1rem 0;}
-.pv-card {border: 1px solid rgba(128,128,128,.25); border-radius: 16px; padding: 1.1rem 1.3rem;
-          background: rgba(128,128,128,.06);}
-.pv-label {font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; opacity: .65;}
-.pv-hr {display: flex; align-items: center; gap: .8rem; margin: .3rem 0 .2rem 0;}
-.pv-bpm {font-size: 3.8rem; font-weight: 800; line-height: 1;}
-.pv-unit {font-size: 1.1rem; opacity: .65; margin-left: .25rem; font-weight: 600;}
-.pv-heart {width: 46px; height: 46px; fill: #e5484d;}
-.pv-heart.beat {animation: pv-beat 1s ease-in-out infinite;}
-.pv-heart.idle {fill: rgba(128,128,128,.45);}
-@keyframes pv-beat {0%, 100% {transform: scale(1);} 15% {transform: scale(1.18);} 30% {transform: scale(1);}}
-.pv-tag {font-size: .72rem; font-weight: 700; border-radius: 999px; padding: .15rem .55rem;
-         background: rgba(210,153,34,.2); color: #d29922; vertical-align: middle;}
-.pv-pills {display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .9rem;}
-.pv-pill {border-radius: 999px; padding: .28rem .75rem; font-size: .82rem; font-weight: 600;}
-.pv-ok {background: rgba(46,160,67,.18); color: #3fb950;}
-.pv-warn {background: rgba(210,153,34,.2); color: #d29922;}
-.pv-bad {background: rgba(248,81,73,.18); color: #f85149;}
-.pv-info {background: rgba(56,139,253,.18); color: #58a6ff;}
-.pv-neutral {background: rgba(128,128,128,.18);}
-.pv-status {margin-top: .9rem; padding: .65rem .85rem; border-radius: 10px; font-size: .95rem; font-weight: 500;}
-.pv-progress {height: 6px; border-radius: 3px; background: rgba(128,128,128,.25); overflow: hidden; margin-top: .55rem;}
-.pv-progress > div {height: 100%; background: #e5484d;}
-.pv-note {font-size: .75rem; opacity: .6; margin-top: .8rem;}
-</style>
-"""
-
-HEART_SVG = ('<svg class="pv-heart {cls}" style="animation-duration:{period:.2f}s" viewBox="0 0 24 24">'
-             '<path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 2.8 4.5 6.6 4.5c2.1 0 3.6 1.1 4.4 2.6.8-1.5 2.3-2.6 '
-             '4.4-2.6 3.8 0 5.7 3.9 4.2 7.3C19.5 16.4 12 21 12 21z"/></svg>')
+LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "pulsevision.log")
 
 
-def draw_line_chart(placeholder, df, x, columns, colors, y_title, x_type="quantitative", points=False):
-    """Draw a line chart of df[columns] against df[x].
-
-    Uses st.vega_lite_chart because st.line_chart takes ~60 ms per call,
-    which pauses frame capture and leaves gaps in the pulse signal.
-    """
-    spec = {
-        "height": 230,
-        "mark": {"type": "line", "strokeWidth": 2, "point": points, "interpolate": "monotone"},
-        "transform": [{"fold": columns, "as": ["Signal", "Value"]}],
-        "encoding": {
-            "x": {"field": x, "type": x_type, "title": None if x_type == "temporal" else x},
-            "y": {"field": "Value", "type": "quantitative", "title": y_title, "scale": {"zero": False}},
-            "color": {
-                "field": "Signal",
-                "type": "nominal",
-                "scale": {"domain": columns, "range": colors},
-                "legend": {"orient": "bottom"} if len(columns) > 1 else None,
-            },
-        },
-    }
-    placeholder.vega_lite_chart(df, spec, width="stretch")
+# ---- Process-wide singletons: they survive Streamlit reruns, so the serial port is
+# ---- opened once and alert cooldowns are not forgotten when a widget is clicked.
+@st.cache_resource
+def setup_logging():
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger = logging.getLogger("pulsevision")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    return logger
 
 
-def vitals_html(bpm, held, quality, patient_present, moving, status, status_kind, progress, high_bpm=None):
-    """Build the HTML for the vitals card."""
-    high = bpm is not None and high_bpm is not None and bpm > high_bpm
-    if bpm is not None:
-        heart = HEART_SVG.format(cls="beat", period=60.0 / bpm)
-        value = (f'<span class="pv-bpm" style="color:{"#f85149" if high else "inherit"}">{bpm:.0f}</span>'
-                 f'<span class="pv-unit">BPM</span>')
-        if held:
-            value += ' <span class="pv-tag">HELD</span>'
-    else:
-        heart = HEART_SVG.format(cls="idle", period=1)
-        value = '<span class="pv-bpm">--</span><span class="pv-unit">BPM</span>'
-
-    quality_class = {"Good": "pv-ok", "Fair": "pv-warn", "Poor": "pv-bad"}.get(quality, "pv-neutral")
-    pills = [
-        f'<span class="pv-pill {"pv-ok" if patient_present else "pv-bad"}">'
-        f'Patient: {"Detected" if patient_present else "Not detected"}</span>',
-        f'<span class="pv-pill {quality_class}">Signal quality: {quality or "Measuring"}</span>',
-        f'<span class="pv-pill {"pv-warn" if moving else "pv-ok"}">'
-        f'{"Movement detected" if moving else "Still"}</span>',
-    ]
-    if high:
-        pills.append(f'<span class="pv-pill pv-bad">Above {high_bpm:.0f} BPM</span>')
-    bar = (f'<div class="pv-progress"><div style="width:{progress * 100:.0f}%"></div></div>'
-           if progress is not None else "")
-    return (
-        f'<div class="pv-card"><div class="pv-label">Estimated Heart Rate</div>'
-        f'<div class="pv-hr">{heart}<div>{value}</div></div>'
-        f'<div class="pv-pills">{"".join(pills)}</div>'
-        f'<div class="pv-status pv-{status_kind}">{status}</div>{bar}'
-        f'<div class="pv-note">Estimate from facial video - not a medical device.</div></div>'
-    )
+@st.cache_resource
+def get_reader():
+    """The one SerialReader. Connects automatically to a detected Arduino on first start."""
+    reader = SerialReader()
+    cfg = load_config()
+    port = cfg["serial"]["port"]
+    if port == "auto":
+        port = detect_arduino_port()
+    if port and port != MOCK_PORT and port in [p for p, _ in list_serial_ports()]:
+        reader.connect(port, cfg["serial"]["baud"])
+    return reader
 
 
-def draw_no_patient(frame):
-    """Darken the video and write 'Patient not detected' across it."""
-    frame[:] = (frame * 0.45).astype(frame.dtype)
-    text = "Patient not detected"
-    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-    x, y = (frame.shape[1] - w) // 2, (frame.shape[0] + h) // 2
-    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (90, 90, 255), 2, cv2.LINE_AA)
+@st.cache_resource
+def get_engine():
+    return AlertEngine()
+
+
+@st.cache_resource
+def get_recorder():
+    return DataRecorder()
+
+
+@st.cache_resource
+def get_notifier():
+    return EmailNotifier()
+
+
+@st.cache_resource
+def get_firebase_notification_service():
+    service = FirebaseNotificationService()
+    service.start_background_sync(interval_seconds=2.0)
+    return service
 
 
 def show_session_status(placeholder):
@@ -146,274 +98,467 @@ def show_session_status(placeholder):
         return
     total = len(st.session_state.readings)
     unsaved = total - st.session_state.saved_count
-    placeholder.caption(f"Session **{session_id}**: {total} readings, {unsaved} not saved")
+    placeholder.caption(f"Session {session_id}: {total} readings, {unsaved} not saved")
 
 
-def show_trend(placeholder):
-    """Line chart of the heart rates recorded in this session."""
-    readings = st.session_state.get("readings", [])
-    if len(readings) < 2:
-        placeholder.caption("The heart-rate trend appears here once readings are recorded.")
-        return
-    df = pd.DataFrame(readings).rename(columns={"timestamp": "Time", "bpm": "BPM"})
-    draw_line_chart(placeholder, df, "Time", ["BPM"], [PULSE_COLOR], "BPM", x_type="temporal")
+def _num(value):
+    """Optional number as float (Streamlit number inputs must not mix int and float)."""
+    return None if value is None else float(value)
 
 
-def deliver_alert(alert):
-    """Show the alert as a pop-up and save it (the Notification app picks it up from the database)."""
-    timestamp = datetime.now().isoformat(timespec="seconds")
-    save_alert(st.session_state.session_id, timestamp, alert)
-
-    icon = ":material/notifications:" if alert.quiet else ":material/warning:"
-    st.toast(alert.message, icon=icon)
-
-
-# ---------------------------------------------------------------- Page layout
-st.set_page_config(page_title="PulseVision", page_icon=":material/favorite:", layout="wide")
-st.markdown(CSS, unsafe_allow_html=True)
-st.markdown('<div class="pv-title">Pulse<span>Vision</span></div>'
-            '<div class="pv-sub">Non-contact heart rate estimation from facial video (rPPG)</div>',
-            unsafe_allow_html=True)
-
-with st.sidebar:
-    st.header("Controls")
-    running = st.toggle("Start measurement")
-    use_cheeks = st.toggle("Use cheeks as well as forehead", value=True,
-                           help="More skin pixels give a cleaner pulse signal.")
-    show_landmarks = st.checkbox("Show facial landmarks")
-
-    # st.session_state keeps values between Streamlit reruns (e.g. when a button is
-    # clicked), so the readings are not lost. Switching measurement on starts a new session.
-    if running and not st.session_state.get("was_running", False):
-        st.session_state.session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        st.session_state.readings = []
-        st.session_state.saved_count = 0
-    st.session_state.was_running = running
-
-    st.divider()
-    st.subheader("Session")
-    save_clicked = st.button("Save session", icon=":material/save:", width="stretch")
-    save_message = st.empty()
-    session_status = st.empty()
-    if save_clicked:
-        new_readings = st.session_state.get("readings", [])[st.session_state.get("saved_count", 0):]
-        if not new_readings:
-            save_message.info("No new readings to save yet.")
-        else:
-            save_readings(st.session_state.session_id, new_readings)
-            st.session_state.saved_count += len(new_readings)
-            save_message.success(f"Saved {len(new_readings)} readings to the database.")
-    show_session_status(session_status)
-
-    st.divider()
-    st.subheader("Alerts")
-    high_bpm = st.number_input("High heart rate alert above (BPM)", min_value=80, max_value=180,
-                               value=HIGH_BPM_DEFAULT, step=5, key="high_bpm",
-                               help="An alert is raised as soon as a shown heart rate goes above this.")
-    st.caption("Alerts are listed in the Notification app (http://localhost:8502).")
-
-col_video, col_vitals = st.columns([3, 2], gap="large")
-with col_video:
-    video_placeholder = st.empty()
-with col_vitals:
-    alert_banner = st.empty()
-    vitals_card = st.empty()
-    debug_status = st.empty()
-
-col_pulse, col_trend = st.columns(2, gap="large")
-with col_pulse:
-    st.subheader("Pulse signal")
-    st.caption("Filtered pulse waveform - each peak is one heartbeat")
-    pulse_chart = st.empty()
-with col_trend:
-    st.subheader("Heart rate trend")
-    st.caption("Readings recorded in this session")
-    trend_chart = st.empty()
-show_trend(trend_chart)
-
-with st.expander("Signal details (debug)"):
-    st.caption("Frequency spectrum of the pulse - the highest peak is the heart rate")
-    spectrum_chart = st.empty()
-    col_raw, col_norm = st.columns(2)
-    with col_raw:
-        st.caption("Mean skin colour (0-255)")
-        raw_chart = st.empty()
-    with col_norm:
-        st.caption("Change from each channel's average (%)")
-        norm_chart = st.empty()
-
-if not running:
-    video_placeholder.info("Turn on **Start measurement** in the sidebar to open the webcam.",
-                           icon=":material/videocam:")
-    vitals_card.markdown(vitals_html(None, False, None, False, False, "Not measuring", "neutral", None),
-                         unsafe_allow_html=True)
-    pulse_chart.caption("The pulse waveform appears here while measuring.")
-    st.stop()
-
-camera = Camera()
-if not camera.is_opened():
-    camera.release()
-    video_placeholder.error(
-        "Could not open the webcam. Check that it is connected and not already "
-        "in use by another app or another PulseVision browser tab."
+def render_monitor_panel(snap, active_alerts, monitoring, record_enabled, recorder_status):
+    """Hardware readings, patient presence, active alerts and recording status."""
+    st.markdown("##### Arduino sensors")
+    icons = {"connected": "🟢", "connecting": "🟡", "reconnecting": "🟠", "error": "🔴", "disconnected": "⚪"}
+    conn_line = f"{icons.get(snap.hw_status, '⚪')} Connection: **{snap.hw_status}**"
+    if snap.hw_port:
+        conn_line += f" ({snap.hw_port})"
+    if snap.hw_status == "connected":
+        freshness = "⚠️ stale (waiting for new line)" if snap.hw_stale else "fresh (1 Hz)"
+        conn_line += f" | Data: **{freshness}**"
+    elif snap.hw_last_received is not None and snap.hw_stale:
+        conn_line += f" | Last data: **stale ({snap.hw_age_s:.0f} s ago)**"
+    st.caption(conn_line)
+    if snap.hw_simulated:
+        st.warning("SIMULATED readings (mock serial) - not real patient measurements.")
+    if snap.hw_format == "legacy_raw":
+        st.info("Arduino is sending raw IR/RED values only (old sketch). Upload "
+                "firmware/pulsevision_sensors to get heart rate and SpO2.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sensor HR", f"{snap.hw_hr_bpm:.0f} BPM" if snap.hw_hr_bpm is not None else "--")
+    c2.metric("Sensor SpO2*", f"{snap.hw_spo2_pct:.0f} %" if snap.hw_spo2_pct is not None else "--")
+    c3.metric("Motion (MPU)", f"{snap.hw_motion_g:.2f} g" if snap.hw_motion_g is not None else "--")
+    temp_val = f"{snap.hw_object_temp_c:.1f} °C" if snap.hw_object_temp_c is not None else "--"
+    temp_secondary = f"Ambient: {snap.hw_ambient_temp_c:.1f} °C" if snap.hw_ambient_temp_c is not None else None
+    if snap.hw_mlx_ok is False:
+        temp_val = "Error"
+        temp_secondary = "Sensor fault"
+    c4.metric(
+        "Skin Surface Temperature",
+        temp_val,
+        delta=temp_secondary,
+        delta_color="off",
     )
-    st.stop()
+    if snap.hw_last_received is not None:
+        last = datetime.fromtimestamp(snap.hw_last_received).strftime("%H:%M:%S")
+        mpu_txt = ""
+        if snap.hw_accel_g is not None:
+            mpu_txt = f" | Accel: {snap.hw_accel_g:.2f} g"
+            if snap.hw_gyro_dps is not None:
+                mpu_txt += f", Gyro: {snap.hw_gyro_dps:.0f} °/s"
+        temp_txt = ""
+        if snap.hw_ambient_temp_c is not None:
+            temp_txt = f" | Amb: {snap.hw_ambient_temp_c:.1f} °C"
+        st.caption(f"Last reading {last} ({snap.hw_age_s:.0f} s ago){mpu_txt}{temp_txt}. *SpO2 is uncalibrated. Skin surface temp is NOT core body temp.")
+    if snap.hw_sensor_ok is False:
+        st.error("MAX30100 reports a sensor error - check wiring.")
+    if snap.hw_mpu_ok is False:
+        st.error("MPU9250/6500/9255 reports a sensor error - check wiring.")
+    if snap.hw_mlx_ok is False:
+        st.error("MLX90614 temperature sensor reports an error - check wiring.")
 
-# ---------------------------------------------------------------- Measurement loop
-detector = None
-buffer = RGBBuffer()
-tracker = HeartRateTracker()
-motion = MotionDetector()
-monitor = AlertMonitor()
-
-# Streamlit stops this loop automatically when the toggle is switched off,
-# and the 'finally' block releases the webcam.
-try:
-    detector = FaceMeshDetector()
-    start_time = time.time()
-    last_process_time = 0.0
-    last_motion_time = -100.0
-    last_card = None
-    banner_shown = False
-    while True:
-        frame = camera.read()
-        if frame is None:
-            video_placeholder.error("Could not read a frame from the webcam.")
-            break
-
-        # ---- Face -> movement check -> skin regions -> mean RGB (every frame) ----
-        timestamp = time.time() - start_time
-        landmarks = detector.detect(frame, timestamp * 1000)
-        patient_present = landmarks is not None
-        rois = get_rois(landmarks, use_cheeks) if patient_present else {}
-
-        alert = monitor.update_face(timestamp, patient_present)
-        if alert:
-            deliver_alert(alert)
-
-        moving = False
-        if not patient_present:
-            # Patient gone: forget the signal and the reading
-            buffer.clear()
-            tracker.reset()
-            motion.reset()
+    st.markdown("##### Patient and alerts")
+    if not monitoring:
+        st.caption("Monitoring is off - alerts are not being checked.")
+        return
+    presence_text = {"present": "In view", "absent": f"Not detected ({snap.absent_seconds:.0f} s)",
+                     "unknown": "Unknown (camera unavailable)"}[snap.presence]
+    st.metric("Patient presence", presence_text)
+    if active_alerts:
+        for alert in active_alerts:
+            st.error(f"**{alert.category}**: {alert.message}  \nEmail: {alert.delivery_status}")
+    else:
+        st.success("No active alerts")
+    if record_enabled:
+        text = f"Recording: {recorder_status['rows_written']} rows saved"
+        if recorder_status["last_error"]:
+            st.warning(f"{text} - {recorder_status['last_error']}")
         else:
-            moving = motion.is_moving(motion.update(timestamp, landmarks))
-            if moving:
-                # Movement corrupts the colour signal, so throw the window away and
-                # hold the last good reading until a clean window has been collected
-                buffer.clear()
-                tracker.restart_window()
-                last_motion_time = timestamp
-            elif rois:
+            st.caption(text + " to data/pulsevision.db")
+    else:
+        st.caption("Recording is off.")
+
+
+st.set_page_config(page_title="PulseVision", layout="wide")
+setup_logging()
+reader = get_reader()
+engine = get_engine()
+recorder = get_recorder()
+notifier = get_notifier()
+firebase_notifications = get_firebase_notification_service()
+config = load_config()
+
+if "pv_dark_mode" not in st.session_state:
+    st.session_state.pv_dark_mode = True
+
+title_col, theme_col = st.columns([5, 1])
+with title_col:
+    st.title("PulseVision")
+with theme_col:
+    st.toggle("Dark mode", key="pv_dark_mode", help="Switch the dashboard between dark and light mode.")
+
+dark_mode = st.session_state.pv_dark_mode
+theme = {
+    "bg": "#0e1117" if dark_mode else "#f5f7fb",
+    "panel": "#151b24" if dark_mode else "#ffffff",
+    "card": "#17212b" if dark_mode else "#ffffff",
+    "text": "#f5f7fa" if dark_mode else "#1f2937",
+    "muted": "#b6c1cc" if dark_mode else "#536273",
+    "border": "#2a3948" if dark_mode else "#d9e0e8",
+    "ok_bg": "#12352d" if dark_mode else "#e8f7f0",
+    "ok_border": "#236e57" if dark_mode else "#9bd8bf",
+    "warn_bg": "#3c3019" if dark_mode else "#fff5dc",
+    "warn_border": "#8b6a27" if dark_mode else "#e4c36e",
+    "danger_bg": "#3e2025" if dark_mode else "#ffebed",
+    "danger_border": "#8f3944" if dark_mode else "#e4a1a8",
+    "muted_bg": "#202a34" if dark_mode else "#eef2f6",
+    "muted_border": "#3b4b5b" if dark_mode else "#cbd5df",
+}
+st.markdown(
+    f"""
+    <style>
+    :root {{
+      --pv-bg:{theme['bg']}; --pv-panel:{theme['panel']}; --pv-card:{theme['card']};
+      --pv-text:{theme['text']}; --pv-muted:{theme['muted']}; --pv-border:{theme['border']};
+      --pv-status-ok-bg:{theme['ok_bg']}; --pv-status-ok-border:{theme['ok_border']};
+      --pv-status-warn-bg:{theme['warn_bg']}; --pv-status-warn-border:{theme['warn_border']};
+      --pv-status-danger-bg:{theme['danger_bg']}; --pv-status-danger-border:{theme['danger_border']};
+      --pv-status-muted-bg:{theme['muted_bg']}; --pv-status-muted-border:{theme['muted_border']};
+    }}
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] {{ background:var(--pv-bg); color:var(--pv-text); }}
+    [data-testid="stHeader"], section[data-testid="stSidebar"] {{ background:var(--pv-panel); }}
+    [data-testid="stAppViewContainer"] h1, [data-testid="stAppViewContainer"] h2,
+    [data-testid="stAppViewContainer"] h3, [data-testid="stAppViewContainer"] h4,
+    [data-testid="stAppViewContainer"] p, [data-testid="stAppViewContainer"] label {{ color:var(--pv-text); }}
+    [data-testid="stAppViewContainer"] .stCaption, [data-testid="stAppViewContainer"] small {{ color:var(--pv-muted); }}
+    [data-baseweb="input"] > div, [data-baseweb="select"] > div,
+    [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input {{
+      background:var(--pv-card); color:var(--pv-text); border-color:var(--pv-border);
+    }}
+    .stButton > button, [data-testid="stFormSubmitButton"] button {{
+      background:var(--pv-card); color:var(--pv-text); border-color:var(--pv-border);
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.caption("Computer Vision Based Non Contact Heart Rate Detection Using Facial Video")
+
+# ---- Sidebar: Arduino connection and alert settings ----
+with st.sidebar:
+    st.header("Arduino")
+    ports = list_serial_ports()
+    port_names = [p for p, _ in ports] + [MOCK_PORT]
+    descriptions = dict(ports)
+    hw_state = reader.snapshot()
+    preferred = hw_state["port"] or config["serial"]["port"]
+    if preferred not in port_names:
+        preferred = detect_arduino_port() or port_names[0]
+    port = st.selectbox("Serial port", port_names, index=port_names.index(preferred),
+                        format_func=lambda p: f"{p} - {descriptions[p]}" if p in descriptions else p)
+    baud = st.number_input("Baud rate", min_value=300, max_value=2_000_000,
+                           value=int(config["serial"]["baud"]), step=100)
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Connect", width="stretch"):
+        reader.connect(port, baud)
+        config["serial"]["port"], config["serial"]["baud"] = port, int(baud)
+        save_config(config)
+        time.sleep(0.5)
+    if b2.button("Disconnect", width="stretch"):
+        reader.disconnect()
+    b3.button("Refresh", width="stretch", help="Refresh the list of serial ports")
+    hw_state = reader.snapshot()
+    st.caption(f"Connection: **{hw_state['status']}**" + (f" on {hw_state['port']}" if hw_state["port"] else ""))
+    if hw_state["last_error"] and hw_state["status"] != "connected":
+        st.caption(f"Last error: {hw_state['last_error']}")
+    if hw_state["status"] != "disconnected":
+        st.caption(f"Valid readings: {hw_state['valid_count']} | rejected lines: {hw_state['malformed_count']}"
+                   + (f" | reconnects: {hw_state['reconnect_count']}" if hw_state.get("reconnect_count") else ""))
+
+    record_enabled = st.toggle("Record monitoring data", value=True,
+                               help="Save hardware, camera, presence and alert data once per second")
+
+    with st.expander("Alert settings"):
+        with st.form("alert_settings"):
+            st.caption("Leave a threshold empty to disable it. No clinical defaults are provided.")
+            new_cfg = load_config()
+            for key, meta in METRICS.items():
+                st.markdown(f"**{meta['label']}** ({meta['unit']})")
+                lo_valid, hi_valid = meta["valid_range"]
+                c_low, c_high = st.columns(2)
+                rule = new_cfg["thresholds"][key]
+                rule["low"] = c_low.number_input("Low", value=_num(rule["low"]), min_value=float(lo_valid),
+                                                 max_value=float(hi_valid), key=f"{key}_low")
+                rule["high"] = c_high.number_input("High", value=_num(rule["high"]), min_value=float(lo_valid),
+                                                   max_value=float(hi_valid), key=f"{key}_high")
+            new_cfg["presence"]["absence_seconds"] = st.number_input(
+                "Alert when patient not detected for (s)", value=_num(new_cfg["presence"]["absence_seconds"]),
+                min_value=1.0)
+            new_cfg["disagreement_bpm"] = st.number_input(
+                "Alert when sensor and camera HR differ by more than (BPM)",
+                value=_num(new_cfg["disagreement_bpm"]), min_value=1.0)
+            new_cfg["hardware_fault_alerts"] = st.checkbox(
+                "Alert on Arduino disconnection / stale data", value=new_cfg["hardware_fault_alerts"])
+            new_cfg["serial"]["stale_seconds"] = st.number_input(
+                "Treat Arduino data as stale after (s)", value=float(new_cfg["serial"]["stale_seconds"]),
+                min_value=1.0)
+            new_cfg["confirm_seconds"] = st.number_input(
+                "Condition must last (s) before alerting", value=float(new_cfg["confirm_seconds"]),
+                min_value=0.0)
+            new_cfg["cooldown_seconds"] = st.number_input(
+                "Cooldown between alerts of the same kind (s)", value=float(new_cfg["cooldown_seconds"]),
+                min_value=0.0)
+            new_cfg["email"]["enabled"] = st.checkbox("Send email alerts", value=new_cfg["email"]["enabled"])
+            new_cfg["email"]["recipient"] = st.text_input(
+                "Recipient email", value=new_cfg["email"]["recipient"] or default_recipient())
+            if st.form_submit_button("Save settings"):
+                errors = save_config(new_cfg)
+                if errors:
+                    for error in errors:
+                        st.error(error)
+                else:
+                    config = new_cfg
+                    st.success("Settings saved.")
+
+        missing = missing_settings()
+        if missing:
+            st.caption("Email not configured - set " + ", ".join(missing) + " (see .env.example).")
+        if notifier.last_result:
+            st.caption(f"Last email ({notifier.last_result[0]}): {notifier.last_result[1]}")
+
+tab_live, tab_analytics, tab_notifications = st.tabs(
+    ["Live Monitoring", "Analytics", "Notifications & Alerts"])
+with tab_analytics:
+    render_analytics()
+with tab_notifications:
+    @st.fragment(run_every="2s")
+    def live_notification_feed():
+        render_notification_feed(
+            firebase_notifications, config, notifier,
+            active_alerts=list(engine.active.values()),
+            monitoring=st.session_state.get("was_running", False),
+        )
+    live_notification_feed()
+
+with tab_live:
+    col_video, col_info = st.columns([2, 1])
+
+    with col_info:
+        running = st.toggle("Start measurement")
+        show_landmarks = st.checkbox("Show facial landmarks")
+
+        # st.session_state keeps values between Streamlit reruns (e.g. when a button is
+        # clicked), so the readings are not lost. Switching measurement on starts a new session.
+        if running and not st.session_state.get("was_running", False):
+            st.session_state.session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+            st.session_state.readings = []
+            st.session_state.saved_count = 0
+            engine.reset()
+        st.session_state.was_running = running
+
+        save_clicked = st.button("Save session")
+        save_message = st.empty()
+        session_status = st.empty()
+        if save_clicked:
+            new_readings = st.session_state.get("readings", [])[st.session_state.get("saved_count", 0):]
+            if not new_readings:
+                save_message.info("No new readings to save yet.")
+            else:
+                save_readings(st.session_state.session_id, new_readings)
+                st.session_state.saved_count += len(new_readings)
+                save_message.success(f"Saved {len(new_readings)} readings to the database.")
+        show_session_status(session_status)
+
+        heart_rate_metric = st.empty()
+        quality_metric = st.empty()
+        face_status = st.empty()
+        signal_status = st.empty()
+        signal_progress = st.empty()
+        st.divider()
+        monitor_panel = st.empty()
+
+    with col_video:
+        video_placeholder = st.empty()
+
+    @st.fragment(run_every=1.0)
+    def idle_monitor_panel():
+        """Live Arduino status while measurement is off (alerts are not checked)."""
+        snap = build_snapshot(reader.snapshot(), config["serial"]["stale_seconds"])
+        render_monitor_panel(snap, [], False, record_enabled, recorder.status())
+
+
+    if not running:
+        video_placeholder.info("Turn on 'Start measurement' to open the webcam.")
+        heart_rate_metric.metric("Estimated Heart Rate", "--")
+        with monitor_panel.container():
+            idle_monitor_panel()
+        st.stop()
+
+
+    def on_email_done(alert, status):
+        recorder.update_alert(alert.uid, delivery_status=status)
+        database.update_notification_status(
+            alert.uid, "SENT" if status == "sent" else "FAILED", detail=status,
+            failure_reason=None if status == "sent" else status)
+
+
+    def monitor_step(camera_status, face_detected, presence, absent_seconds, cam_bpm, cam_quality):
+        """Combine hardware + camera, evaluate alert rules, notify, record and update the panel."""
+        hw = reader.snapshot()
+        snap = build_snapshot(
+            hw, config["serial"]["stale_seconds"], session_id=st.session_state.session_id,
+            camera_status=camera_status, cam_bpm=cam_bpm, cam_quality=cam_quality,
+            face_detected=face_detected, presence=presence, absent_seconds=absent_seconds,
+        )
+        new_alerts, cleared = engine.evaluate(snap, config, hardware_expected=hw["status"] != "disconnected")
+        snap.active_alerts = engine.active_keys()
+        for alert in new_alerts:
+            recorder.record_alert(alert)
+            firebase_notifications.record_alert(alert, config, snap)
+            if not alert.notify:
+                continue
+            if config["email"]["enabled"]:
+                result = notifier.notify(
+                    alert, config["email"]["recipient"] or default_recipient(), on_done=on_email_done)
+                if result is None:
+                    database.update_notification_status(alert.uid, "QUEUED", detail="Queued for Gmail SMTP")
+            else:
+                alert.delivery_status = "not sent (email alerts disabled)"
+                recorder.update_alert(alert.uid, delivery_status=alert.delivery_status)
+        for alert in cleared:
+            recorder.update_alert(alert.uid, cleared_at=snap.timestamp)
+            firebase_notifications.mark_recovered(alert)
+        if record_enabled:
+            recorder.log_snapshot(snap)
+        with monitor_panel.container():
+            render_monitor_panel(snap, list(engine.active.values()), True, record_enabled, recorder.status())
+
+
+    camera = Camera()
+    if not camera.is_opened():
+        camera.release()
+        camera = None
+        # Hardware monitoring and alerts keep running without the camera
+        video_placeholder.error(
+            "Could not open the webcam. Check that it is connected and not already "
+            "in use by another app or another PulseVision browser tab. "
+            "Arduino monitoring continues without the camera."
+        )
+
+    detector = None
+    buffer = RGBBuffer()
+    smoother = BPMSmoother()
+    presence_tracker = PresenceTracker()
+
+    # Streamlit stops this loop automatically when the toggle is switched off,
+    # and the 'finally' block releases the webcam.
+    try:
+        if camera is not None:
+            detector = FaceMeshDetector()
+        start_time = time.time()
+        last_process_time = 0.0
+        last_monitor_time = 0.0
+        heart_rate = None  # smoothed BPM shown to the user, None when not available
+        quality = None     # "Good" / "Fair" / "Poor", None while collecting signal
+        while True:
+            frame = camera.read() if camera is not None else None
+            if frame is None:
+                if camera is not None:
+                    video_placeholder.error("Could not read a frame from the webcam. "
+                                            "Arduino monitoring continues without the camera.")
+                    camera.release()
+                    camera = None
+                    buffer.clear()
+                    smoother.clear()
+                    heart_rate = None
+                    quality = None
+                # Camera unavailable: presence is "unknown", never "absent"
+                presence, absent_seconds = presence_tracker.update(None, time.time())
+                if time.time() - last_monitor_time >= MONITOR_INTERVAL_SECONDS:
+                    last_monitor_time = time.time()
+                    monitor_step("unavailable", None, presence, absent_seconds, None, None)
+                time.sleep(0.2)
+                continue
+
+            # ---- Face -> ROI -> mean RGB (every frame) ----
+            timestamp = time.time() - start_time
+            landmarks = detector.detect(frame, timestamp * 1000)
+            roi = get_forehead_roi(landmarks) if landmarks is not None else None
+            presence, absent_seconds = presence_tracker.update(landmarks is not None, time.time())
+
+            if roi is not None:
                 # Read the colours BEFORE drawing anything on the frame
-                rgb, _ = mean_rgb_of_rois(frame, rois)
-                buffer.add(timestamp, rgb)
+                pixels = extract_roi_pixels(frame, roi)
+                buffer.add(timestamp, mean_rgb(pixels))
             else:
-                # Face too small for the skin regions: no usable signal, hold the reading
+                # The signal must be continuous, so start again when the face is lost
                 buffer.clear()
-                tracker.restart_window()
+                smoother.clear()
+                heart_rate = None
+                quality = None
 
-        # ---- RGB -> rPPG -> filter -> FFT -> BPM (once per second) ----
-        if timestamp - last_process_time >= PROCESS_INTERVAL_SECONDS:
-            last_process_time = timestamp
+            # ---- RGB -> rPPG -> filter -> FFT -> BPM (once per second) ----
+            if timestamp - last_process_time >= PROCESS_INTERVAL_SECONDS:
+                last_process_time = timestamp
 
-            if buffer.duration() >= MIN_PULSE_SECONDS:
-                times, values = buffer.get_arrays()
-                uniform_times, uniform_rgb = resample(times, values)
-                pulse = bandpass_filter(pos(uniform_rgb, SAMPLE_RATE))
+                if buffer.duration() >= MIN_PULSE_SECONDS:
+                    times, values = buffer.get_arrays()
+                    _, uniform_rgb = resample(times, values)
+                    pulse = bandpass_filter(pos(uniform_rgb, SAMPLE_RATE))
 
-                if buffer.duration() >= MIN_BPM_SECONDS:
-                    freqs, power = power_spectrum(pulse)
-                    raw_bpm, peak_ratio = find_heart_rate(freqs, power)
-                    accepted = tracker.update(timestamp, raw_bpm, peak_ratio)
+                    if buffer.duration() >= MIN_BPM_SECONDS:
+                        freqs, power = power_spectrum(pulse)
+                        raw_bpm, peak_ratio = find_heart_rate(freqs, power)
+                        quality = signal_quality(peak_ratio) if raw_bpm is not None else "Poor"
+                        if quality == "Poor":
+                            smoother.clear()  # never show a heart rate from a poor signal
+                        else:
+                            smoother.add(raw_bpm)
+                        heart_rate = smoother.value()
 
-                    # Record each accepted reading (held or poor-quality values are never recorded)
-                    shown_bpm, _ = tracker.shown_value(timestamp)
-                    if accepted and shown_bpm is not None:
-                        st.session_state.readings.append({
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                            "bpm": round(shown_bpm, 1),
-                            "quality": tracker.quality,
-                        })
-                        show_session_status(session_status)
-                        show_trend(trend_chart)
+                        # Record the value shown to the user (poor-quality results are never recorded)
+                        if heart_rate is not None:
+                            st.session_state.readings.append({
+                                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                "bpm": round(heart_rate, 1),
+                                "quality": quality,
+                            })
+                            show_session_status(session_status)
 
-                        # ---- Alerts: high heart rate, sharp fluctuation (quiet) ----
-                        for alert in monitor.update_heart_rate(timestamp, shown_bpm, high_bpm,
-                                                               tracker.quality):
-                            deliver_alert(alert)
+            # ---- Hardware + camera -> alerts, recording, panel (once per second) ----
+            if time.time() - last_monitor_time >= MONITOR_INTERVAL_SECONDS:
+                last_monitor_time = time.time()
+                monitor_step("ok", landmarks is not None, presence, absent_seconds, heart_rate, quality)
 
-                    in_range = (freqs * 60 >= MIN_BPM - 10) & (freqs * 60 <= MAX_BPM + 10)
-                    spectrum = pd.DataFrame({"Heart rate (BPM)": freqs[in_range] * 60,
-                                             "Power": power[in_range] / max(power[in_range].max(), 1e-12)})
-                    draw_line_chart(spectrum_chart, spectrum, "Heart rate (BPM)", ["Power"],
-                                    [PULSE_COLOR], "Relative power")
-                    raw_text = f"{raw_bpm:.0f} BPM" if raw_bpm is not None else "invalid"
-                    debug_status.caption(
-                        f"Latest estimate: {raw_text} ({'used' if accepted else 'not used'}) | "
-                        f"peak power ratio: {peak_ratio:.2f} | sampling rate: {buffer.sampling_rate():.1f}/s"
-                    )
+            # ---- Status shown to the user (every frame) ----
+            face_status.metric("Face", "Detected" if landmarks is not None else "Not detected")
+            heart_rate_metric.metric("Estimated Heart Rate", f"{heart_rate:.0f} BPM" if heart_rate else "--")
+            quality_metric.metric("Signal Quality", quality or "--")
 
-                # Charts: scale the pulse to a standard deviation of 1 so the range stays steady
-                pulse_df = pd.DataFrame({"Time (s)": uniform_times, "Pulse": pulse / max(pulse.std(), 1e-12)})
-                draw_line_chart(pulse_chart, pulse_df, "Time (s)", ["Pulse"], [PULSE_COLOR], "Pulse")
-                raw = pd.DataFrame(values, columns=["R", "G", "B"])
-                raw["Time (s)"] = times
-                norm = pd.DataFrame((values / values.mean(axis=0) - 1) * 100, columns=["R", "G", "B"])
-                norm["Time (s)"] = times
-                draw_line_chart(raw_chart, raw, "Time (s)", ["R", "G", "B"], RGB_COLORS, "Mean value")
-                draw_line_chart(norm_chart, norm, "Time (s)", ["R", "G", "B"], RGB_COLORS, "Change (%)")
+            if landmarks is None:
+                signal_status.warning("Face not detected")
+                signal_progress.empty()
+            elif roi is None:
+                signal_status.warning("Forehead too small - move closer to the camera.")
+                signal_progress.empty()
+            elif quality is None:
+                signal_status.info(f"Collecting signal... {buffer.duration():.0f} / {MIN_BPM_SECONDS:.0f} s")
+                signal_progress.progress(min(buffer.duration() / MIN_BPM_SECONDS, 1.0))
+            elif heart_rate is None:
+                signal_status.warning(POOR_SIGNAL_MESSAGE)
+                signal_progress.empty()
             else:
-                pulse_chart.caption("Collecting signal...")
+                signal_status.success("Measuring - please stay still")
+                signal_progress.empty()
 
-        # ---- What the user sees (every frame, only sent when something changed) ----
-        bpm, held = tracker.shown_value(timestamp)
-        recently_moved = timestamp - last_motion_time < MOTION_MESSAGE_SECONDS
-        progress = None
-        if not patient_present:
-            status, kind = "Patient not detected", "bad"
-        elif recently_moved:
-            status, kind = "Movement detected - please stay still.", "warn"
-            if bpm is not None:
-                status += " Holding the last reading."
-        elif not rois:
-            status, kind = "Move closer to the camera.", "warn"
-        elif tracker.quality is None:
-            status = f"Measuring... {buffer.duration():.0f} / {MIN_BPM_SECONDS:.0f} s"
-            if bpm is not None:
-                status += " - showing the last reading"
-            kind = "info"
-            progress = min(buffer.duration() / MIN_BPM_SECONDS, 1.0)
-        elif tracker.quality == "Poor":
-            status, kind = POOR_SIGNAL_MESSAGE, "warn"
-        else:
-            status, kind = "Measuring - please stay still", "ok"
-
-        card = vitals_html(bpm, held, tracker.quality, patient_present, recently_moved, status, kind,
-                           progress, high_bpm)
-        if card != last_card:
-            vitals_card.markdown(card, unsafe_allow_html=True)
-            last_card = card
-
-        if monitor.is_absent() != banner_shown:
-            banner_shown = monitor.is_absent()
-            if banner_shown:
-                alert_banner.error("Patient not present in front of the camera.", icon=":material/person_off:")
-            else:
-                alert_banner.empty()
-
-        # Draw overlays last, so they never affect the measured colours
-        if not patient_present:
-            draw_no_patient(frame)
-        else:
-            if show_landmarks:
+            # Draw overlays last, so they never affect the measured colours
+            if landmarks is not None and show_landmarks:
                 draw_landmarks(frame, landmarks)
-            color = ORANGE if recently_moved else GREEN
-            for name, box in rois.items():
-                draw_roi(frame, box, "Forehead" if name == "Forehead" else "Cheek", color)
-        video_placeholder.image(frame, channels="BGR", width="stretch")
-finally:
-    camera.release()
-    if detector is not None:
-        detector.close()
+            if roi is not None:
+                draw_roi(frame, roi)
+            video_placeholder.image(frame, channels="BGR", width="stretch")
+    finally:
+        if camera is not None:
+            camera.release()
+        if detector is not None:
+            detector.close()

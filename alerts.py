@@ -1,140 +1,186 @@
-"""Alerts: warn when the patient is not detected, or the heart rate is high or changes sharply.
+"""Alert rules: thresholds, bed presence, camera/sensor disagreement and hardware faults.
 
-AlertMonitor decides *when* to alert. Each Alert records the exact condition that
-fired and the readings at that moment. PulseVision shows it as a pop-up and saves it
-to the database, where the Notification app (notification_app.py) picks it up.
+Categories keep a real measurement problem separate from an equipment problem:
+  THRESHOLD     - a measured value crossed a user-configured limit
+  PRESENCE      - the patient has not been seen for the configured duration
+  DISAGREEMENT  - sensor and camera heart rates differ by more than the tolerance
+  SENSOR_FAULT  - Arduino disconnected, readings stale, or sensor reports an error
 
-These alerts are based on an *estimated* heart rate. They are not medical alarms.
+Missing readings never trigger a THRESHOLD alert - they can only show up as a
+SENSOR_FAULT (if enabled). Each alert notifies once when it starts; it must
+clear before it can alert again, and the cooldown stops a flapping condition
+from sending repeated emails.
 """
 
-from collections import deque
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
 
-ABSENCE_SECONDS = 10               # no face for this long -> "patient not present"
-FLUCTUATION_WINDOW_SECONDS = 30    # look at the shown heart rate over this period...
-FLUCTUATION_BPM = 25               # ...and alert if it changes by more than this
-FLUCTUATION_COOLDOWN_SECONDS = 60  # do not repeat the fluctuation alert more often than this
-HIGH_BPM_DEFAULT = 120             # default "high heart rate" threshold (can be changed in the dashboard)
-HIGH_BPM_COOLDOWN_SECONDS = 60     # at least this long between two high-heart-rate alerts
+from settings import METRICS
 
-ABSENT = "Patient not present"
-FLUCTUATION = "Heart rate fluctuation"
-HIGH_HEART_RATE = "High heart rate"
+THRESHOLD = "THRESHOLD"
+PRESENCE = "PRESENCE"
+DISAGREEMENT = "DISAGREEMENT"
+SENSOR_FAULT = "SENSOR_FAULT"
 
 
 @dataclass
 class Alert:
-    kind: str              # ABSENT, FLUCTUATION or HIGH_HEART_RATE
-    message: str           # short message for the pop-up
-    condition: str         # the rule that fired, with its limit
-    details: str           # the readings at the moment the alert fired
-    bpm: float = None      # current (or last known) heart rate
-    quality: str = None    # signal quality of that heart rate
-    quiet: bool = False    # quiet alerts are only shown as a small pop-up
+    key: str
+    category: str
+    message: str
+    started_at: float
+    readings: dict
+    session_id: str | None = None
+    simulated: bool = False
+    notify: bool = True
+    delivery_status: str = "pending"
+    uid: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    @property
+    def timestamp(self):
+        return datetime.fromtimestamp(self.started_at).isoformat(timespec="seconds")
+
+    def to_row(self):
+        return {
+            "uid": self.uid, "session_id": self.session_id, "raised_at": self.timestamp,
+            "alert_key": self.key, "category": self.category, "message": self.message,
+            "readings_json": json.dumps(self.readings), "simulated": int(self.simulated),
+            "delivery_status": self.delivery_status,
+        }
 
 
-def clock(seconds_ago=0.0):
-    """Wall-clock time, seconds_ago seconds before now, as HH:MM:SS."""
-    return f"{datetime.now() - timedelta(seconds=seconds_ago):%H:%M:%S}"
+def _fmt(value, unit, decimals=0):
+    if value is None:
+        return "unavailable"
+    return f"{value:.{decimals}f} {unit}"
 
 
-class AlertMonitor:
-    """Watches the face status and the shown heart rate, and returns Alerts when needed."""
+def relevant_readings(snap):
+    """The values included in alert records and emails (labelled by source)."""
+    return {
+        "Sensor heart rate (MAX30100)": _fmt(snap.hw_hr_bpm, "BPM"),
+        "Sensor SpO2 (MAX30100, uncalibrated)": _fmt(snap.hw_spo2_pct, "%"),
+        "Sensor motion (MPU9250/6500/9255)": _fmt(snap.hw_motion_g, "g", decimals=2),
+        "Sensor acceleration (MPU9250/6500/9255)": _fmt(snap.hw_accel_g, "g", decimals=2),
+        "Skin surface temperature (MLX90614, NOT core body temp)": _fmt(snap.hw_object_temp_c, "°C", decimals=1),
+        "Ambient temperature (MLX90614)": _fmt(snap.hw_ambient_temp_c, "°C", decimals=1),
+        "Camera heart rate estimate": _fmt(snap.cam_bpm, "BPM"),
+        "Camera signal quality": snap.cam_quality or "unavailable",
+        "Patient presence": snap.presence,
+        "Arduino status": snap.hw_status + (" (stale)" if snap.hw_stale else ""),
+        "Camera status": snap.camera_status,
+        "Data source": "SIMULATED (mock serial)" if snap.hw_simulated else "Arduino",
+    }
+
+
+def _fmt_val(value, unit):
+    if unit == "g":
+        return f"{value:.2f} {unit}"
+    if unit == "°C":
+        return f"{value:.1f} {unit}"
+    return f"{value:.0f} {unit}"
+
+
+def current_conditions(snap, config, hardware_expected):
+    """Return {key: (category, message, needs_confirmation)} for every condition true right now."""
+    found = {}
+
+    for metric, meta in METRICS.items():
+        value = getattr(snap, metric)
+        if value is None:
+            continue  # missing data is not a threshold breach
+        rule = config["thresholds"].get(metric, {})
+        high, low = rule.get("high"), rule.get("low")
+        unit = meta["unit"]
+        if high is not None and value > high:
+            found[f"{metric}_high"] = (THRESHOLD, f"{meta['label']} is {_fmt_val(value, unit)}, "
+                                       f"above the configured limit of {high} {unit}", True)
+        if low is not None and value < low:
+            found[f"{metric}_low"] = (THRESHOLD, f"{meta['label']} is {_fmt_val(value, unit)}, "
+                                      f"below the configured limit of {low} {unit}", True)
+
+    absence = config["presence"].get("absence_seconds")
+    if absence and snap.presence == "absent" and snap.absent_seconds >= absence:
+        found["patient_absent"] = (PRESENCE, f"Patient not detected for {snap.absent_seconds:.0f} s "
+                                   f"(configured limit {absence:.0f} s)", False)
+
+    tolerance = config.get("disagreement_bpm")
+    if (tolerance and snap.hw_hr_bpm is not None and snap.cam_bpm is not None
+            and snap.cam_quality in ("Good", "Fair")):
+        diff = abs(snap.hw_hr_bpm - snap.cam_bpm)
+        if diff > tolerance:
+            found["hr_disagreement"] = (DISAGREEMENT, f"Sensor ({snap.hw_hr_bpm:.0f} BPM) and camera "
+                                        f"({snap.cam_bpm:.0f} BPM) heart rates differ by {diff:.0f} BPM "
+                                        f"(tolerance {tolerance} BPM)", True)
+
+    if config.get("hardware_fault_alerts") and hardware_expected:
+        if snap.hw_status != "connected":
+            found["hw_disconnected"] = (SENSOR_FAULT, f"Arduino is not connected (status: {snap.hw_status})", True)
+        elif snap.hw_stale:
+            found["hw_stale"] = (SENSOR_FAULT, "No valid Arduino reading received recently (data stale)", True)
+        else:
+            if snap.hw_sensor_ok is False:
+                found["hw_sensor_error"] = (SENSOR_FAULT, "MAX30100 sensor reports an error", True)
+            if snap.hw_mpu_ok is False:
+                found["hw_mpu_error"] = (SENSOR_FAULT, "MPU9250/6500/9255 motion sensor reports an error", True)
+            if snap.hw_mlx_ok is False:
+                found["hw_mlx_error"] = (SENSOR_FAULT, "MLX90614 temperature sensor reports an error — check wiring", True)
+    return found
+
+
+class AlertEngine:
+    """Tracks which conditions are active and decides when to notify."""
 
     def __init__(self):
-        self.face_missing_since = None
-        self.absence_alerted = False
-        self.recent_bpm = deque()  # (time in seconds, bpm) of shown heart rates
-        self.last_fluctuation_time = None
-        self.high_alerted = False  # True while the heart rate stays above the threshold after an alert
-        self.last_high_time = None # when the last high-heart-rate alert fired
-        self.last_bpm = None       # last recorded heart rate, its quality and time
-        self.last_quality = None
-        self.last_bpm_time = None
+        self.pending = {}         # key -> time first seen (waiting for confirmation)
+        self.active = {}          # key -> Alert
+        self.last_notified = {}   # key -> time of last notification
 
-    def update_face(self, now, face_present):
-        """Call every frame. Returns an Alert once per absence that lasts ABSENCE_SECONDS."""
-        if face_present:
-            self.face_missing_since = None
-            self.absence_alerted = False
-            return None
+    def evaluate(self, snap, config, hardware_expected=True):
+        """Update state from one snapshot.
 
-        # The measurement restarts when the face returns, so old heart rates no longer apply
-        self.recent_bpm.clear()
-        self.high_alerted = False
-        if self.face_missing_since is None:
-            self.face_missing_since = now
-        absent_for = now - self.face_missing_since
-        if not self.absence_alerted and absent_for >= ABSENCE_SECONDS:
-            self.absence_alerted = True
-            details = f"Patient not detected since {clock(absent_for)} ({absent_for:.0f} s)."
-            if self.last_bpm is not None:
-                details += (f" Last heart rate: {self.last_bpm:.0f} BPM ({self.last_quality} signal) "
-                            f"at {clock(now - self.last_bpm_time)}.")
+        Returns (new_alerts, cleared_alerts). Every new Alert has .notify set to
+        False if it falls inside the cooldown of an earlier alert of the same kind.
+        """
+        now = snap.time
+        conditions = current_conditions(snap, config, hardware_expected)
+        confirm = float(config.get("confirm_seconds") or 0)
+        cooldown = float(config.get("cooldown_seconds") or 0)
+
+        new_alerts = []
+        for key, (category, message, needs_confirm) in conditions.items():
+            if key in self.active:
+                continue
+            first_seen = self.pending.setdefault(key, now)
+            if needs_confirm and now - first_seen < confirm:
+                continue
+            alert = Alert(key=key, category=category, message=message, started_at=now,
+                          readings=relevant_readings(snap), session_id=snap.session_id,
+                          simulated=snap.hw_simulated)
+            last = self.last_notified.get(key)
+            if last is not None and now - last < cooldown:
+                alert.notify = False
+                alert.delivery_status = "suppressed (cooldown)"
             else:
-                details += " No heart rate was measured before the patient left."
-            return Alert(
-                ABSENT,
-                "The patient is not detected in front of the camera.",
-                condition=f"No face detected for {ABSENCE_SECONDS} s (limit: {ABSENCE_SECONDS} s)",
-                details=details,
-                bpm=self.last_bpm,
-                quality=self.last_quality,
-            )
-        return None
+                self.last_notified[key] = now
+            self.active[key] = alert
+            new_alerts.append(alert)
 
-    def is_absent(self):
-        """True while a 'patient not present' alert is active."""
-        return self.absence_alerted
+        cleared = []
+        for key in list(self.pending):
+            if key not in conditions:
+                del self.pending[key]
+        for key in list(self.active):
+            if key not in conditions:
+                cleared.append(self.active.pop(key))
+        return new_alerts, cleared
 
-    def update_heart_rate(self, now, bpm, high_threshold=HIGH_BPM_DEFAULT, quality=None):
-        """Call whenever a new heart rate is recorded. Returns a list of Alerts (often empty)."""
-        alerts = []
-        self.last_bpm, self.last_quality, self.last_bpm_time = bpm, quality, now
+    def active_keys(self):
+        return sorted(self.active)
 
-        # High heart rate: as soon as a shown reading goes above the threshold.
-        # Shown readings are already smoothed and quality-checked, so one noisy estimate
-        # cannot cause this. It fires once per rise above the threshold, and at most once
-        # every HIGH_BPM_COOLDOWN_SECONDS so a value hovering around the limit does not spam.
-        previous = [b for _, b in self.recent_bpm][-4:]
-        if bpm > high_threshold:
-            cooled_down = (self.last_high_time is None
-                           or now - self.last_high_time >= HIGH_BPM_COOLDOWN_SECONDS)
-            if not self.high_alerted and cooled_down:
-                self.high_alerted = True
-                self.last_high_time = now
-                recent = ", ".join(f"{b:.0f}" for b in previous + [bpm])
-                alerts.append(Alert(
-                    HIGH_HEART_RATE,
-                    f"High heart rate: {bpm:.0f} BPM (limit {high_threshold:.0f} BPM).",
-                    condition=f"Heart rate above {high_threshold:.0f} BPM",
-                    details=(f"Heart rate {bpm:.0f} BPM ({quality} signal) at {clock()}, "
-                             f"{bpm - high_threshold:.0f} BPM above the limit. Recent readings: {recent} BPM."),
-                    bpm=bpm,
-                    quality=quality,
-                ))
-        else:
-            self.high_alerted = False  # back at or below the limit: the next rise alerts again
-
-        # Fluctuation: the heart rate changed by more than FLUCTUATION_BPM within the window
-        self.recent_bpm.append((now, bpm))
-        while now - self.recent_bpm[0][0] > FLUCTUATION_WINDOW_SECONDS:
-            self.recent_bpm.popleft()
-        values = [b for _, b in self.recent_bpm]
-        change = max(values) - min(values)
-        cooled_down = (self.last_fluctuation_time is None
-                       or now - self.last_fluctuation_time >= FLUCTUATION_COOLDOWN_SECONDS)
-        if change > FLUCTUATION_BPM and cooled_down:
-            self.last_fluctuation_time = now
-            alerts.append(Alert(
-                FLUCTUATION,
-                f"Heart rate changed by {change:.0f} BPM within {FLUCTUATION_WINDOW_SECONDS} s.",
-                condition=f"Change of more than {FLUCTUATION_BPM} BPM within {FLUCTUATION_WINDOW_SECONDS} s",
-                details=(f"Heart rate ranged from {min(values):.0f} to {max(values):.0f} BPM; "
-                         f"now {bpm:.0f} BPM ({quality} signal). Please check the patient and the measurement."),
-                bpm=bpm,
-                quality=quality,
-                quiet=True,
-            ))
-        return alerts
+    def reset(self):
+        """Forget active/pending conditions (cooldown history is kept)."""
+        self.pending.clear()
+        self.active.clear()

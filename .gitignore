@@ -2,12 +2,21 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
 
 # MediaPipe model (downloaded automatically on first run)
 models/
 
-# Local database
+# Local database and logs
 data/*.db
+data/*.log
+
+# Local configuration & secrets
+.env
+config.json
+config.json.tmp
+firebase/functions/node_modules/
+firebase/functions/lib/
 
 # Editor / tool settings
 .claude/

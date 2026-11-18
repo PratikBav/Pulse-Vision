@@ -4,3 +4,7 @@ numpy
 scipy
 streamlit
 pandas
+pyserial
+pytest
+firebase-admin>=6.5
+python-dotenv
